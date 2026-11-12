@@ -1,0 +1,352 @@
+{
+  "formato": 1,
+  "revisao": 3,
+  "descricao": "Modelos dos comandos de instalação do agente que a central mostra em \"Instalar agente\". Fonte única: mudou o instalar.sh/instalar.ps1 (URL, pasta, opções, pré-requisitos) -> atualize aqui, suba a revisao e copie para a central (assets/instalacao/comandos.json). Marcadores: {{config_json}} (JSON de configuração, uma linha, só ASCII), {{config_bash}}/{{config_ps}} (o mesmo JSON como texto entre aspas simples do bash/PowerShell), {{empresa_bash}}/{{nome_bash}} e {{empresa_ps}}/{{nome_ps}} (argumentos entre aspas simples; no PowerShell com \\\" para o programa nativo). Comando com \"segredo\": true é mascarado na tela.",
+  "ambientes": [
+    {
+      "id": "ubuntu-20",
+      "nome": "Ubuntu 20.04, 22.04 ou 24.04",
+      "sistema": "linux",
+      "terminal": "PuTTY (SSH)",
+      "sufixo_nome": "Linux",
+      "resumo": "Python do sistema (3.8 ou mais novo); o monitor roda como serviço do sistema (systemd) e volta sozinho quando o servidor reinicia.",
+      "notas": [
+        "Usuário com sudo (o usual nos servidores da C2).",
+        "Pasta: /home/c2/server_monitor; serviço \"server-monitor\" (systemd); painel na sessão tmux \"monitor\"."
+      ],
+      "comandos": [
+        {
+          "id": "unico",
+          "titulo": "Instalar e configurar (um comando só)",
+          "segredo": true,
+          "descricao": "Cole no PuTTY, conectado ao servidor com um usuário que tenha sudo. Instala o necessário, baixa o instalador, aplica a configuração (empresa, nome, Firebase e chave do catálogo) e abre o painel sem perguntar nada. O espaço no começo evita que o comando (com o código de cadastro) fique no histórico do bash; o arquivo temporário com a configuração é apagado em seguida.",
+          "modelo": " F=$(mktemp) && printf '%s\\n' {{config_bash}} > \"$F\" && sudo env USAGE_MONITOR_CONFIG=\"$F\" bash -c 'command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl; }; python3 -c \"import sys; sys.exit(sys.version_info < (3, 8))\" 2>/dev/null || { apt-get update -qq && apt-get install -y -qq python3.8; }; curl -fsSL -H \"Accept: application/vnd.github.raw\" -o /tmp/instalar.sh https://api.github.com/repos/cbalmeida/server_monitor_releases/contents/instalar.sh && bash /tmp/instalar.sh'; rm -f \"$F\""
+        },
+        {
+          "id": "instalar",
+          "titulo": "Só instalar (o monitor pergunta a configuração)",
+          "descricao": "Alternativa sem a configuração embutida: quando o monitor pedir, cole o JSON de configuração abaixo.",
+          "modelo": "sudo bash -c 'command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl; }; python3 -c \"import sys; sys.exit(sys.version_info < (3, 8))\" 2>/dev/null || { apt-get update -qq && apt-get install -y -qq python3.8; }; curl -fsSL -H \"Accept: application/vnd.github.raw\" -o /tmp/instalar.sh https://api.github.com/repos/cbalmeida/server_monitor_releases/contents/instalar.sh && bash /tmp/instalar.sh'"
+        },
+        {
+          "id": "config",
+          "titulo": "JSON de configuração",
+          "segredo": true,
+          "tipo": "json",
+          "descricao": "Para colar quando o monitor perguntar (\"Cole o JSON de configuração\").",
+          "modelo": "{{config_json}}"
+        },
+        {
+          "id": "rodar_de_novo",
+          "titulo": "Rodar o instalador de novo (atualiza; configuração e histórico ficam)",
+          "modelo": "sudo bash /home/c2/server_monitor/instalar.sh"
+        },
+        {
+          "id": "painel",
+          "titulo": "Abrir o painel (Ctrl+B e depois D sai deixando-o aberto; a coleta continua no serviço)",
+          "modelo": "sudo tmux -u new-session -A -s monitor \"bash /home/c2/server_monitor/iniciar.sh --view\"",
+          "descricao": "Abre a sessão tmux \"monitor\" com o painel (ou entra nela, se já existir). Fechar o painel (q) não para o monitor: ele roda como serviço."
+        },
+        {
+          "id": "status",
+          "titulo": "Situação do serviço (ativo? inicia no boot? últimas linhas)",
+          "modelo": "sudo systemctl status server-monitor --no-pager -n 20"
+        },
+        {
+          "id": "parar",
+          "titulo": "Parar o monitor (volta sozinho no próximo boot)",
+          "descricao": "Para o serviço gravando a janela em andamento; a central mostra o monitor parado. Ele volta quando o servidor reiniciar ou com o comando \"Iniciar o monitor\".",
+          "modelo": "sudo systemctl stop server-monitor"
+        },
+        {
+          "id": "iniciar",
+          "titulo": "Iniciar o monitor (depois de parado)",
+          "modelo": "sudo systemctl start server-monitor"
+        },
+        {
+          "id": "mudar_nome",
+          "titulo": "Trocar empresa e nome do servidor (e reiniciar o monitor)",
+          "modelo": "cd /home/c2/server_monitor && sudo python3 usage_monitor.py --empresa {{empresa_bash}} --nome {{nome_bash}} && sudo bash instalar.sh"
+        },
+        {
+          "id": "diagnostico",
+          "titulo": "Diagnóstico (texto para o suporte)",
+          "modelo": "cd /home/c2/server_monitor && sudo python3 usage_monitor.py --diagnostico"
+        }
+      ]
+    },
+    {
+      "id": "debian",
+      "nome": "Debian 11 ou 12",
+      "sistema": "linux",
+      "terminal": "PuTTY (SSH)",
+      "sufixo_nome": "Linux",
+      "resumo": "Python do sistema (3.9 ou 3.11); o monitor roda como serviço do sistema (systemd) e volta sozinho quando o servidor reinicia.",
+      "notas": [
+        "Precisa do sudo instalado (apt-get install sudo, como root) ou rode o comando como root sem o \"sudo\".",
+        "Pasta: /home/c2/server_monitor; serviço \"server-monitor\" (systemd); painel na sessão tmux \"monitor\"."
+      ],
+      "comandos": [
+        {
+          "id": "unico",
+          "titulo": "Instalar e configurar (um comando só)",
+          "segredo": true,
+          "descricao": "Cole no PuTTY, conectado ao servidor com um usuário que tenha sudo. Instala o necessário, baixa o instalador, aplica a configuração (empresa, nome, Firebase e chave do catálogo) e abre o painel sem perguntar nada. O espaço no começo evita que o comando (com o código de cadastro) fique no histórico do bash; o arquivo temporário com a configuração é apagado em seguida.",
+          "modelo": " F=$(mktemp) && printf '%s\\n' {{config_bash}} > \"$F\" && sudo env USAGE_MONITOR_CONFIG=\"$F\" bash -c 'command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl; }; python3 -c \"import sys; sys.exit(sys.version_info < (3, 8))\" 2>/dev/null || { apt-get update -qq && apt-get install -y -qq python3.8; }; curl -fsSL -H \"Accept: application/vnd.github.raw\" -o /tmp/instalar.sh https://api.github.com/repos/cbalmeida/server_monitor_releases/contents/instalar.sh && bash /tmp/instalar.sh'; rm -f \"$F\""
+        },
+        {
+          "id": "instalar",
+          "titulo": "Só instalar (o monitor pergunta a configuração)",
+          "descricao": "Alternativa sem a configuração embutida: quando o monitor pedir, cole o JSON de configuração abaixo.",
+          "modelo": "sudo bash -c 'command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl; }; python3 -c \"import sys; sys.exit(sys.version_info < (3, 8))\" 2>/dev/null || { apt-get update -qq && apt-get install -y -qq python3.8; }; curl -fsSL -H \"Accept: application/vnd.github.raw\" -o /tmp/instalar.sh https://api.github.com/repos/cbalmeida/server_monitor_releases/contents/instalar.sh && bash /tmp/instalar.sh'"
+        },
+        {
+          "id": "config",
+          "titulo": "JSON de configuração",
+          "segredo": true,
+          "tipo": "json",
+          "descricao": "Para colar quando o monitor perguntar (\"Cole o JSON de configuração\").",
+          "modelo": "{{config_json}}"
+        },
+        {
+          "id": "rodar_de_novo",
+          "titulo": "Rodar o instalador de novo (atualiza; configuração e histórico ficam)",
+          "modelo": "sudo bash /home/c2/server_monitor/instalar.sh"
+        },
+        {
+          "id": "painel",
+          "titulo": "Abrir o painel (Ctrl+B e depois D sai deixando-o aberto; a coleta continua no serviço)",
+          "modelo": "sudo tmux -u new-session -A -s monitor \"bash /home/c2/server_monitor/iniciar.sh --view\"",
+          "descricao": "Abre a sessão tmux \"monitor\" com o painel (ou entra nela, se já existir). Fechar o painel (q) não para o monitor: ele roda como serviço."
+        },
+        {
+          "id": "status",
+          "titulo": "Situação do serviço (ativo? inicia no boot? últimas linhas)",
+          "modelo": "sudo systemctl status server-monitor --no-pager -n 20"
+        },
+        {
+          "id": "parar",
+          "titulo": "Parar o monitor (volta sozinho no próximo boot)",
+          "descricao": "Para o serviço gravando a janela em andamento; a central mostra o monitor parado. Ele volta quando o servidor reiniciar ou com o comando \"Iniciar o monitor\".",
+          "modelo": "sudo systemctl stop server-monitor"
+        },
+        {
+          "id": "iniciar",
+          "titulo": "Iniciar o monitor (depois de parado)",
+          "modelo": "sudo systemctl start server-monitor"
+        },
+        {
+          "id": "mudar_nome",
+          "titulo": "Trocar empresa e nome do servidor (e reiniciar o monitor)",
+          "modelo": "cd /home/c2/server_monitor && sudo python3 usage_monitor.py --empresa {{empresa_bash}} --nome {{nome_bash}} && sudo bash instalar.sh"
+        },
+        {
+          "id": "diagnostico",
+          "titulo": "Diagnóstico (texto para o suporte)",
+          "modelo": "cd /home/c2/server_monitor && sudo python3 usage_monitor.py --diagnostico"
+        }
+      ]
+    },
+    {
+      "id": "ubuntu-18",
+      "nome": "Ubuntu 18.04",
+      "sistema": "linux",
+      "terminal": "PuTTY (SSH)",
+      "sufixo_nome": "Linux",
+      "resumo": "Python 3.8 do apt (universe), ao lado do 3.6 do sistema; o monitor roda como serviço do sistema (systemd) e volta sozinho quando o servidor reinicia.",
+      "notas": [
+        "O python3 do sistema (3.6) fica como está: o Python 3.8 do repositório universe é instalado ao lado.",
+        "Pasta: /home/c2/server_monitor; serviço \"server-monitor\" (systemd); painel na sessão tmux \"monitor\"."
+      ],
+      "comandos": [
+        {
+          "id": "unico",
+          "titulo": "Instalar e configurar (um comando só)",
+          "segredo": true,
+          "descricao": "Cole no PuTTY, conectado ao servidor com um usuário que tenha sudo. Instala o necessário, baixa o instalador, aplica a configuração (empresa, nome, Firebase e chave do catálogo) e abre o painel sem perguntar nada. O espaço no começo evita que o comando (com o código de cadastro) fique no histórico do bash; o arquivo temporário com a configuração é apagado em seguida.",
+          "modelo": " F=$(mktemp) && printf '%s\\n' {{config_bash}} > \"$F\" && sudo env USAGE_MONITOR_CONFIG=\"$F\" bash -c 'command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl; }; command -v python3.8 >/dev/null || { add-apt-repository -y universe && apt-get update -qq && apt-get install -y -qq python3.8; }; curl -fsSL -H \"Accept: application/vnd.github.raw\" -o /tmp/instalar.sh https://api.github.com/repos/cbalmeida/server_monitor_releases/contents/instalar.sh && bash /tmp/instalar.sh'; rm -f \"$F\""
+        },
+        {
+          "id": "instalar",
+          "titulo": "Só instalar (o monitor pergunta a configuração)",
+          "descricao": "Alternativa sem a configuração embutida: quando o monitor pedir, cole o JSON de configuração abaixo.",
+          "modelo": "sudo bash -c 'command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl; }; command -v python3.8 >/dev/null || { add-apt-repository -y universe && apt-get update -qq && apt-get install -y -qq python3.8; }; curl -fsSL -H \"Accept: application/vnd.github.raw\" -o /tmp/instalar.sh https://api.github.com/repos/cbalmeida/server_monitor_releases/contents/instalar.sh && bash /tmp/instalar.sh'"
+        },
+        {
+          "id": "config",
+          "titulo": "JSON de configuração",
+          "segredo": true,
+          "tipo": "json",
+          "descricao": "Para colar quando o monitor perguntar (\"Cole o JSON de configuração\").",
+          "modelo": "{{config_json}}"
+        },
+        {
+          "id": "rodar_de_novo",
+          "titulo": "Rodar o instalador de novo (atualiza; configuração e histórico ficam)",
+          "modelo": "sudo bash /home/c2/server_monitor/instalar.sh"
+        },
+        {
+          "id": "painel",
+          "titulo": "Abrir o painel (Ctrl+B e depois D sai deixando-o aberto; a coleta continua no serviço)",
+          "modelo": "sudo tmux -u new-session -A -s monitor \"bash /home/c2/server_monitor/iniciar.sh --view\"",
+          "descricao": "Abre a sessão tmux \"monitor\" com o painel (ou entra nela, se já existir). Fechar o painel (q) não para o monitor: ele roda como serviço."
+        },
+        {
+          "id": "status",
+          "titulo": "Situação do serviço (ativo? inicia no boot? últimas linhas)",
+          "modelo": "sudo systemctl status server-monitor --no-pager -n 20"
+        },
+        {
+          "id": "parar",
+          "titulo": "Parar o monitor (volta sozinho no próximo boot)",
+          "descricao": "Para o serviço gravando a janela em andamento; a central mostra o monitor parado. Ele volta quando o servidor reiniciar ou com o comando \"Iniciar o monitor\".",
+          "modelo": "sudo systemctl stop server-monitor"
+        },
+        {
+          "id": "iniciar",
+          "titulo": "Iniciar o monitor (depois de parado)",
+          "modelo": "sudo systemctl start server-monitor"
+        },
+        {
+          "id": "mudar_nome",
+          "titulo": "Trocar empresa e nome do servidor (e reiniciar o monitor)",
+          "modelo": "cd /home/c2/server_monitor && sudo python3.8 usage_monitor.py --empresa {{empresa_bash}} --nome {{nome_bash}} && sudo bash instalar.sh"
+        },
+        {
+          "id": "diagnostico",
+          "titulo": "Diagnóstico (texto para o suporte)",
+          "modelo": "cd /home/c2/server_monitor && sudo python3.8 usage_monitor.py --diagnostico"
+        }
+      ]
+    },
+    {
+      "id": "ubuntu-16",
+      "nome": "Ubuntu 16.04",
+      "sistema": "linux",
+      "terminal": "PuTTY (SSH)",
+      "sufixo_nome": "Linux",
+      "resumo": "Python 3.8.20 compilado em /usr/local (make altinstall; o python3 do sistema fica como está); o monitor roda como serviço do sistema (systemd) e volta sozinho quando o servidor reinicia.",
+      "notas": [
+        "Não há Python 3.8 no apt: o comando compila o 3.8.20 em /usr/local (10 a 30 minutos na 1ª vez; nas seguintes reaproveita).",
+        "Pasta: /home/c2/server_monitor; serviço \"server-monitor\" (systemd); painel na sessão tmux \"monitor\"."
+      ],
+      "comandos": [
+        {
+          "id": "unico",
+          "titulo": "Instalar e configurar (um comando só)",
+          "segredo": true,
+          "descricao": "Cole no PuTTY, conectado ao servidor com um usuário que tenha sudo. Instala o necessário, baixa o instalador, aplica a configuração (empresa, nome, Firebase e chave do catálogo) e abre o painel sem perguntar nada. O espaço no começo evita que o comando (com o código de cadastro) fique no histórico do bash; o arquivo temporário com a configuração é apagado em seguida.",
+          "modelo": " F=$(mktemp) && printf '%s\\n' {{config_bash}} > \"$F\" && sudo env USAGE_MONITOR_CONFIG=\"$F\" bash -c 'command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl; }; /usr/local/bin/python3.8 -c \"import curses, ssl\" 2>/dev/null || { echo \"Compilando o Python 3.8.20 (10 a 30 minutos)...\" && apt-get update -qq && apt-get install -y -qq build-essential libncursesw5-dev libssl-dev zlib1g-dev libffi-dev libbz2-dev libreadline-dev libsqlite3-dev && cd /usr/local/src && curl -fsSLO https://www.python.org/ftp/python/3.8.20/Python-3.8.20.tgz && tar xzf Python-3.8.20.tgz && cd Python-3.8.20 && ./configure --prefix=/usr/local >/dev/null && make -j\"$(nproc)\" >/dev/null && make altinstall >/dev/null && /usr/local/bin/python3.8 -c \"import curses, ssl; print(ssl.OPENSSL_VERSION)\" && cd /tmp; } || exit 1; curl -fsSL -H \"Accept: application/vnd.github.raw\" -o /tmp/instalar.sh https://api.github.com/repos/cbalmeida/server_monitor_releases/contents/instalar.sh && bash /tmp/instalar.sh'; rm -f \"$F\""
+        },
+        {
+          "id": "instalar",
+          "titulo": "Só instalar (o monitor pergunta a configuração)",
+          "descricao": "Alternativa sem a configuração embutida: quando o monitor pedir, cole o JSON de configuração abaixo.",
+          "modelo": "sudo bash -c 'command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl; }; /usr/local/bin/python3.8 -c \"import curses, ssl\" 2>/dev/null || { echo \"Compilando o Python 3.8.20 (10 a 30 minutos)...\" && apt-get update -qq && apt-get install -y -qq build-essential libncursesw5-dev libssl-dev zlib1g-dev libffi-dev libbz2-dev libreadline-dev libsqlite3-dev && cd /usr/local/src && curl -fsSLO https://www.python.org/ftp/python/3.8.20/Python-3.8.20.tgz && tar xzf Python-3.8.20.tgz && cd Python-3.8.20 && ./configure --prefix=/usr/local >/dev/null && make -j\"$(nproc)\" >/dev/null && make altinstall >/dev/null && /usr/local/bin/python3.8 -c \"import curses, ssl; print(ssl.OPENSSL_VERSION)\" && cd /tmp; } || exit 1; curl -fsSL -H \"Accept: application/vnd.github.raw\" -o /tmp/instalar.sh https://api.github.com/repos/cbalmeida/server_monitor_releases/contents/instalar.sh && bash /tmp/instalar.sh'"
+        },
+        {
+          "id": "config",
+          "titulo": "JSON de configuração",
+          "segredo": true,
+          "tipo": "json",
+          "descricao": "Para colar quando o monitor perguntar (\"Cole o JSON de configuração\").",
+          "modelo": "{{config_json}}"
+        },
+        {
+          "id": "rodar_de_novo",
+          "titulo": "Rodar o instalador de novo (atualiza; configuração e histórico ficam)",
+          "modelo": "sudo bash /home/c2/server_monitor/instalar.sh"
+        },
+        {
+          "id": "painel",
+          "titulo": "Abrir o painel (Ctrl+B e depois D sai deixando-o aberto; a coleta continua no serviço)",
+          "modelo": "sudo tmux -u new-session -A -s monitor \"bash /home/c2/server_monitor/iniciar.sh --view\"",
+          "descricao": "Abre a sessão tmux \"monitor\" com o painel (ou entra nela, se já existir). Fechar o painel (q) não para o monitor: ele roda como serviço."
+        },
+        {
+          "id": "status",
+          "titulo": "Situação do serviço (ativo? inicia no boot? últimas linhas)",
+          "modelo": "sudo systemctl status server-monitor --no-pager -n 20"
+        },
+        {
+          "id": "parar",
+          "titulo": "Parar o monitor (volta sozinho no próximo boot)",
+          "descricao": "Para o serviço gravando a janela em andamento; a central mostra o monitor parado. Ele volta quando o servidor reiniciar ou com o comando \"Iniciar o monitor\".",
+          "modelo": "sudo systemctl stop server-monitor"
+        },
+        {
+          "id": "iniciar",
+          "titulo": "Iniciar o monitor (depois de parado)",
+          "modelo": "sudo systemctl start server-monitor"
+        },
+        {
+          "id": "mudar_nome",
+          "titulo": "Trocar empresa e nome do servidor (e reiniciar o monitor)",
+          "modelo": "cd /home/c2/server_monitor && sudo /usr/local/bin/python3.8 usage_monitor.py --empresa {{empresa_bash}} --nome {{nome_bash}} && sudo bash instalar.sh"
+        },
+        {
+          "id": "diagnostico",
+          "titulo": "Diagnóstico (texto para o suporte)",
+          "modelo": "cd /home/c2/server_monitor && sudo /usr/local/bin/python3.8 usage_monitor.py --diagnostico"
+        }
+      ]
+    },
+    {
+      "id": "windows",
+      "nome": "Windows Server 2008 R2 ou mais novo (e Windows 7+)",
+      "sistema": "windows",
+      "terminal": "PowerShell como Administrador",
+      "sufixo_nome": "Windows",
+      "resumo": "Python 3.8.10 embutido na pasta do monitor; tarefa agendada \"C2 Server Monitor\" (como SYSTEM).",
+      "notas": [
+        "Abra o PowerShell com \"Executar como administrador\". Funciona no PowerShell 2.0 em diante.",
+        "Windows 7 / 2008 R2: precisa do Service Pack 1, KB2999226 (Universal C Runtime), KB2533623 e, para o TLS 1.2, KB3154518 (ou .NET 4.5+ com WMF 5.1). O instalador avisa o que faltar.",
+        "Pasta: C:\\C2Tecnologia\\ServerMonitor (só SYSTEM e Administradores acessam).",
+        "Monitoramento básico: CPU, memória e espaço; desempenho de disco fica sem dados."
+      ],
+      "comandos": [
+        {
+          "id": "unico",
+          "titulo": "Instalar e configurar (um comando só)",
+          "segredo": true,
+          "descricao": "Cole no PowerShell como Administrador. Baixa o instalador, aplica a configuração (empresa, nome, Firebase e chave do catálogo) e registra a tarefa agendada sem perguntar nada. O arquivo temporário com a configuração é apagado em seguida; o PowerShell 5.1 com PSReadLine atualizado (e o 7) não grava no histórico a linha com a variável $secret.",
+          "modelo": "[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072; $secret = {{config_ps}}; $env:USAGE_MONITOR_CONFIG = \"$env:TEMP\\c2_server_monitor_config.json\"; [IO.File]::WriteAllText($env:USAGE_MONITOR_CONFIG, $secret); $secret = $null; $w = New-Object Net.WebClient; $w.Headers.Add(\"User-Agent\", \"c2\"); $w.Headers.Add(\"Accept\", \"application/vnd.github.raw\"); $w.DownloadFile(\"https://api.github.com/repos/cbalmeida/server_monitor_releases/contents/instalar.ps1\", \"$env:TEMP\\instalar.ps1\"); powershell -NoProfile -ExecutionPolicy Bypass -File \"$env:TEMP\\instalar.ps1\"; Remove-Item -Force -ErrorAction SilentlyContinue $env:USAGE_MONITOR_CONFIG; $env:USAGE_MONITOR_CONFIG = $null"
+        },
+        {
+          "id": "instalar",
+          "titulo": "Só instalar (o monitor pergunta a configuração)",
+          "descricao": "Alternativa sem a configuração embutida: quando o monitor pedir, cole o JSON de configuração abaixo.",
+          "modelo": "[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072; $w = New-Object Net.WebClient; $w.Headers.Add(\"User-Agent\", \"c2\"); $w.Headers.Add(\"Accept\", \"application/vnd.github.raw\"); $w.DownloadFile(\"https://api.github.com/repos/cbalmeida/server_monitor_releases/contents/instalar.ps1\", \"$env:TEMP\\instalar.ps1\"); powershell -NoProfile -ExecutionPolicy Bypass -File \"$env:TEMP\\instalar.ps1\""
+        },
+        {
+          "id": "config",
+          "titulo": "JSON de configuração",
+          "segredo": true,
+          "tipo": "json",
+          "descricao": "Para colar quando o monitor perguntar (\"Cole o JSON de configuração\").",
+          "modelo": "{{config_json}}"
+        },
+        {
+          "id": "rodar_de_novo",
+          "titulo": "Rodar o instalador de novo (atualiza; configuração e histórico ficam)",
+          "modelo": "powershell -NoProfile -ExecutionPolicy Bypass -File \"C:\\C2Tecnologia\\ServerMonitor\\instalar.ps1\""
+        },
+        {
+          "id": "mudar_nome",
+          "titulo": "Trocar empresa e nome do servidor (e reiniciar o monitor)",
+          "modelo": "powershell -NoProfile -ExecutionPolicy Bypass -File \"C:\\C2Tecnologia\\ServerMonitor\\instalar.ps1\" -Parar; & \"C:\\C2Tecnologia\\ServerMonitor\\python\\python.exe\" -X utf8 \"C:\\C2Tecnologia\\ServerMonitor\\usage_monitor.py\" --empresa {{empresa_ps}} --nome {{nome_ps}}; powershell -NoProfile -ExecutionPolicy Bypass -File \"C:\\C2Tecnologia\\ServerMonitor\\instalar.ps1\""
+        },
+        {
+          "id": "diagnostico",
+          "titulo": "Diagnóstico (texto para o suporte)",
+          "modelo": "& \"C:\\C2Tecnologia\\ServerMonitor\\python\\python.exe\" -X utf8 \"C:\\C2Tecnologia\\ServerMonitor\\usage_monitor.py\" --diagnostico"
+        },
+        {
+          "id": "servico",
+          "titulo": "Últimas linhas da saída do serviço",
+          "modelo": "Get-Content -Encoding UTF8 \"C:\\C2Tecnologia\\ServerMonitor\\server_monitor_servico.log\" | Select-Object -Last 30"
+        }
+      ]
+    }
+  ]
+}
