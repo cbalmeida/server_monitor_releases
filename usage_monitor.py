@@ -102,7 +102,7 @@ except ImportError:
 from array import array
 from xml.sax.saxutils import escape as xml_escape
 
-VERSION = "2.17.0"
+VERSION = "2.18.0"
 # Projeto Firebase da C2 (padrão do --firebase-setup). Não são segredos: a URL só identifica o banco e
 # a chave só identifica o projeto (restrita às APIs de login); o acesso é decidido pelas regras.
 FIREBASE_DB_URL = "https://c2-server-monitor-default-rtdb.firebaseio.com"
@@ -1176,9 +1176,10 @@ def machine_id():
 # --------------------------------------------------------------------------
 # Agregação de uma janela -> linha DATA (+ resumo legível)
 # --------------------------------------------------------------------------
-def aggregate(samples, disks, caps, ncpu, cth, mth, dth, ts, loadavg, fs=None):
+def aggregate(samples, disks, caps, ncpu, cth, mth, dth, ts, loadavg, fs=None, queue=None):
     """Linha DATA da janela e resumo legível. fs = filesystems() medidos no fim da janela
-    (None = não medidos: a linha sai sem os campos fs_*, como até a v2.2)."""
+    (None = não medidos: a linha sai sem os campos fs_*, como até a v2.2). queue = última leitura das filas ERP
+    (QueueReader.take; None = sem leitura: a linha sai sem os campos queue_*, como até a v2.17)."""
     V = {}
     for s in samples:
         for k, v in s.items():
@@ -1265,7 +1266,7 @@ def aggregate(samples, disks, caps, ncpu, cth, mth, dth, ts, loadavg, fs=None):
                     F(avg(d + ".io"), "%.0f"), F(mx(d + ".io"), "%.0f"), F(iop, "%.0f%%"),
                     F(avg(d + ".aw"), "%.1f"), F(avg(d + ".qd"), "%.1f")))
     fl = ",".join(flags) if flags else "none"
-    line = o + " flags=" + fl + extra + (fs_fields(fs) if fs is not None else "")
+    line = o + " flags=" + fl + extra + (fs_fields(fs) if fs is not None else "") + (queue_fields(queue) if queue else "")
 
     txt = "\n===== %s | janela %.0f s | %d amostras =====\n" % (hms(), win, n)
     txt += " CPU   méd %s%%  p95 %s%%  máx %s%% | >=%d%%: %d amostras | núcleo mais quente máx %s%% | iowait %s%% steal %s%%\n" % (
@@ -1279,6 +1280,9 @@ def aggregate(samples, disks, caps, ncpu, cth, mth, dth, ts, loadavg, fs=None):
     if fs:
         txt += " ESPAÇO " + " | ".join("%s %.0f%% (%s livres)" % (f["mount"], f["used_pct"], fmt_bytes(f["free_bytes"]))
                                         for f in fs) + "\n"
+    if queue:
+        txt += " FILAS  %s\n" % queue_message(QUEUE_STATES.index(queue["state"]), queue.get("lv"), queue_parse(
+            data_kv("DATA" + queue_fields(queue))), lambda f, *a: f % a)
     txt += " >>> %s" % ("OK - nenhum recurso no teto nesta janela" if fl == "none" else "NO TETO: " + fl)
     return line, txt
 
@@ -1351,6 +1355,20 @@ LEGEND = """\
 #  fs<i>.dev / fs<i>.type   dispositivo e tipo do filesystem
 #  fs<i>.total / fs<i>.free tamanho e espaço livre (bytes; livre = disponível sem ser root)
 #  fs<i>.used    % ocupado, como o df: usado / (usado + livre)
+# Acrescentados na v2.18 (no fim da linha; só com acesso ao banco: filas ERP da
+# Integração FV, lidas de admin.monitor_filas uma vez por janela; NA = não se aplica):
+#  queue_state   ok | leitura_parada (o SocketServer não atualiza a tabela há mais
+#                que o limite) | vazia (sem a linha de totais) | sem_tabela (não
+#                implantadas nesta empresa) | erro (falha ao ler)
+#  queue_lv      nível da pressão na leitura: 0 normal, 1 atenção, 2 crítico
+#                (limites da central; vazia/sem_tabela/erro: sem nível, ou 1 se a
+#                empresa já teve filas lidas — filas perdidas, v2.18)
+#  queue_pct     pressão em % do limite mais próximo (nas filas, não enfileirado ou espera)
+#  queue_age     s desde a última leitura do SocketServer (relógio do banco)
+#  queue_nq / queue_in   registros não enfileirados / nas filas (totais)
+#  queue_done    registros processados hoje (zera à meia-noite; não gera nível)
+#  queue_wait    s de espera do registro mais antigo entre as filas
+#  queue_n       nº de filas com registros
 # Windows (v2.8, monitoramento básico): SESSION termina com platform=windows
 #  monitoring=basico; sem discos (nenhum campo <disco>.*) e NA no que o Windows
 #  não tem: iow, st, load, psi_*, swin/swout/majf. rq = threads esperando CPU
@@ -1531,6 +1549,97 @@ def space_worst(fs):
     return lv, worst
 
 
+# --------------------------------------------------------------------------
+# Filas ERP (v2.18): filas de processamento da Integração FV, que o SocketServer de cada empresa resume em
+# admin.monitor_filas (regravada a cada 1 s; linha 0 = totais, > 0 = uma fila com registros). Lidas pela thread
+# 'filas' (QueueReader, só SELECT) uma vez por janela; o fim da janela só copia a última leitura para a linha DATA.
+# --------------------------------------------------------------------------
+QUEUE_STATES = ("ok", "leitura_parada", "vazia", "sem_tabela", "erro")   # índice = queue_st (coluna numérica)
+QUEUE_DEFAULTS = {"in_queues": 2000, "not_queued": 20000, "wait_s": 1800, "stale_s": 120, "crit_factor": 2}
+QUEUE_FIELDS = (("queue_lv", "lv"), ("queue_pct", "pct"), ("queue_age", "age"), ("queue_nq", "not_queued"),
+                ("queue_in", "in"), ("queue_done", "done"), ("queue_wait", "wait"), ("queue_n", "n"))
+
+
+def fmt_int(n):
+    """3400 -> '3.400' (milhar com ponto, como no Brasil)."""
+    return "{:,}".format(int(n)).replace(",", ".")
+
+
+def queue_limits(get=None):
+    """Limites vigentes: QUEUE_DEFAULTS com a seção queue do agent_config por cima (get(campo, padrão))."""
+    return {k: (get(k, v) if get else v) for k, v in QUEUE_DEFAULTS.items()}
+
+
+def queue_level(r, lim):
+    """(nível, % do limite) de uma leitura ok/leitura_parada; (None, None) nos outros estados.
+    ATENÇÃO: nas filas > limite, não enfileirado > limite, mais antigo esperando > wait_s ou leitura parada.
+    CRÍTICO: quantidade alta E espera longa ao mesmo tempo, ou quantidade >= crit_factor x o limite. Leitura parada
+    (números não confiáveis) fica só em ATENÇÃO; processados no dia nunca geram nível."""
+    if r["state"] not in ("ok", "leitura_parada"):
+        return None, None
+    qi, qn, w = r.get("in") or 0, r.get("not_queued") or 0, r.get("wait") or 0
+    pct = round(100.0 * max(qi / lim["in_queues"], qn / lim["not_queued"], w / lim["wait_s"]), 1)
+    if r["state"] == "leitura_parada":
+        return 1, pct
+    high = qi > lim["in_queues"] or qn > lim["not_queued"]
+    long = w > lim["wait_s"]
+    f = lim["crit_factor"]
+    if (high and long) or qi >= f * lim["in_queues"] or qn >= f * lim["not_queued"]:
+        return 2, pct
+    return (1 if high or long else 0), pct
+
+
+def queue_fields(q):
+    """Campos da linha DATA (v2.18, no fim da linha, depois dos fs*): estado, nível e totais da última leitura."""
+    o = " queue_state=%s" % q["state"]
+    for k, f in QUEUE_FIELDS:
+        v = q.get(f)
+        o += " %s=%s" % (k, "NA" if v is None else (("%.1f" % v) if k == "queue_pct" else "%d" % v))
+    return o
+
+
+def queue_parse(kv):
+    """Colunas numéricas das filas de uma linha DATA ({} se a linha não tem filas: anterior à v2.18 ou sem leitura)."""
+    st = kv.get("queue_state")
+    if st not in QUEUE_STATES:
+        return {}
+    out = {"queue_st": float(QUEUE_STATES.index(st))}
+    for k, _ in QUEUE_FIELDS:
+        try:
+            out[k] = float(kv[k])
+        except (KeyError, ValueError):
+            pass                                    # NA / ausente
+    return out
+
+
+def queue_message(st, lv, r, say):
+    """Frase do diagnóstico das filas (r = colunas numéricas da janela)."""
+    g = lambda k: int(r[k]) if r.get(k) is not None and r[k] == r[k] else 0
+    if st >= 2 and lv:                              # a empresa já teve filas: perdê-las é alerta
+        return say({2: "Filas ERP: a tabela admin.monitor_filas ficou sem a linha de totais (SocketServer parou de "
+                       "gravar?); a empresa já tinha as filas.",
+                    3: "Filas ERP: a tabela admin.monitor_filas sumiu do banco; a empresa já tinha as filas.",
+                    4: "Filas ERP: leitura falhou (admin.monitor_filas); a empresa já tinha as filas."}[st])
+    if st == 2:
+        return say("Filas ERP: sem leitura do SocketServer (admin.monitor_filas sem a linha de totais).")
+    if st == 3:
+        return say("Filas ERP: não implantadas neste banco (sem a tabela admin.monitor_filas).")
+    if st == 4:
+        return say("Filas ERP: falha ao ler admin.monitor_filas.")
+    qi, qn, w = g("queue_in"), g("queue_nq"), g("queue_wait")
+    if st == 1:
+        return say("Filas ERP: leitura do SocketServer parada há %s (desligado, travado ou sem acesso ao Oracle); "
+                   "números não confiáveis.", fmt_span(g("queue_age")))
+    nums = say("%s nas filas, %s não enfileirados", fmt_int(qi), fmt_int(qn))
+    if w:
+        nums += say(", mais antigo esperando há %s", fmt_span(w))
+    if lv == 2:
+        return say("Pressão crítica nas filas ERP: %s.", nums)
+    if lv == 1:
+        return say("Pressão nas filas ERP: %s.", nums)
+    return say("Filas ERP sem pressão: %s." if qi or qn else "Filas ERP vazias: %s.", nums)
+
+
 def lscpu():
     _, out = run("LC_ALL=C lscpu", capture=True)
     r = {}
@@ -1574,6 +1683,7 @@ class Monitor:
         self.sysev = None               # SysEvents (eventos do sistema: admin.system_email), junto com o DbAgent
         self.prof = None                # Profiler (profile do banco pedido pela central), junto com o DbAgent
         self.sql = None                 # SqlEditor (editor SQL remoto, v2.12), junto com o DbAgent
+        self.queues = None              # QueueReader (filas ERP, v2.18), junto com o DbAgent
 
     def say(self, s):
         if self.out:
@@ -1838,11 +1948,11 @@ class Monitor:
             pass
 
     # ---- laço de coleta ----
-    def next_boundary(self):
-        """Próximo fim de janela, alinhado ao relógio (:00, :30... ou :00, :05...).
+    def next_boundary(self, now=None):
+        """Próximo fim de janela depois de now (padrão: agora), alinhado ao relógio (:00, :30... ou :00, :05...).
         Como as viradas de horário caem em múltiplos das duas durações, nenhuma
         janela atravessa a troca."""
-        now = time.time()
+        now = time.time() if now is None else now
         h = time.localtime(now).tm_hour
         iv = self.a.biz_interval if self.a.biz_start <= h < self.a.biz_end else self.a.interval
         return (int(now) // iv + 1) * iv
@@ -1898,8 +2008,10 @@ class Monitor:
         """Grava a janela (linha DATA). first = 1ª janela da sessão: o SyncManager envia já."""
         if not self.samples:
             return
+        # filas ERP: só a última leitura da thread 'filas' (mais velha que a janela = sem dado)
+        q = self.queues.take(len(self.samples) * self.a.sample + QUEUE_LEAD + 5) if self.queues is not None else None
         line, txt = aggregate(self.samples, self.disks, self.capv, self.ncpu, self.a.cpu_hi, self.a.mem_hi,
-                              self.a.disk_hi, iso_now(), self.src.loadavg(), fs=self.src.filesystems())
+                              self.a.disk_hi, iso_now(), self.src.loadavg(), fs=self.src.filesystems(), queue=q)
         self.write(line)
         if self.verbose:
             self.say(txt)
@@ -1945,6 +2057,8 @@ class Monitor:
             self.updater.stop()
         if self.sysev is not None:
             self.sysev.stop()
+        if self.queues is not None:
+            self.queues.stop()
         if self.prof is not None:
             self.prof.stop()
         if self.sql is not None:
@@ -2153,14 +2267,15 @@ DISK_KEYS = ("util_avg util_p95 util_max util_hi rMBs wMBs MBs_max bw_pct_max io
 STORE_BASE = ("n cpu_avg cpu_max cpu_hi_s rq_avg rq_max rq_over rq_over_s psi_cpu psi_cpu_max st_avg st_max hot_avg "
               "load1 mem_avg mem_max mem_hi_s swap swio majf psi_mem psi_mem_full psi_mem_max psi_io psi_io_full "
               "psi_io_max state lv_cpu lv_mem lv_disk lv_space fs_used_max fs_worst_used fs_worst_free fs_worst_total "
-              "fs_worst_id").split()
+              "fs_worst_id lv_queue queue_st queue_lv queue_pct queue_age queue_nq queue_in queue_done queue_wait "
+              "queue_n").split()
 STORE_DISK = ("util_avg util_max util_hi_s MBs_avg MBs_max iops_avg iops_max await qd_avg qd_max bw_pct_max "
               "iops_pct_max riops wiops r_await w_await").split()
 # Campos que a avaliação de condição precisa
 LEVEL_BASE = ("n cpu_avg cpu_p95 cpu_max cpu_hi rq_avg rq_max rq_over psi_cpu psi_cpu_max st_avg st_max hot_avg load1 mem_avg mem_max "
               "mem_hi swap swin swout majf psi_mem psi_mem_full psi_mem_max psi_io psi_io_full psi_io_max").split()
 LEVEL_DISK = "util_avg util_max util_hi rMBs wMBs MBs_max iops_avg iops_max await qd_avg qd_max bw_pct_max iops_pct_max".split()
-RES_KEYS = ("cpu", "mem", "disk", "space")     # recursos avaliados (space = ocupação dos filesystems, v2.3)
+RES_KEYS = ("cpu", "mem", "disk", "space", "queue")   # recursos avaliados (space = filesystems, v2.3; queue = filas ERP, v2.18)
 RAW_KEEP = 8 * 86400          # resolução total dos últimos 8 dias; antes disso, só o resumo por hora
 BUCKET = 3600
 
@@ -2169,11 +2284,13 @@ def diagnose(r, ncpu, disks, msgs=False):
     """Estado de cada recurso numa janela gravada.
 
     Devolve {"cpu": (nível, frase), "mem": (nível, frase), "disk": (nível, frase, disco),
-    "space": (nível, frase, ponto de montagem)} com
+    "space": (nível, frase, ponto de montagem), "queue": (nível, frase)} com
     nível 0 normal, 1 atenção, 2 crítico ou None (sem dados). CRÍTICO sempre exige evidência de
     contenção (fila, PSI, latência ou swap); uso alto sozinho chega no máximo a ATENÇÃO. Espaço
     (r["_fs"], lista de filesystems da janela) é a exceção: disco cheio para o servidor mesmo
-    sem fila, então >= 95% ocupado (ou < 1 GB livre) já é CRÍTICO.
+    sem fila, então >= 95% ocupado (ou < 1 GB livre) já é CRÍTICO. Filas ERP (v2.18): o nível vem gravado na
+    janela (queue_lv, calculado na leitura com os limites da central: queue_level); sem leitura, sem tabela, vazia
+    ou com erro = None (recurso ausente, não alarma).
     Critérios repetidos na ajuda do painel (tecla ?) e no README."""
     def v(k):
         x = r.get(k)
@@ -2276,6 +2393,14 @@ def diagnose(r, ncpu, disks, msgs=False):
         else:
             msg = say("Espaço livre suficiente (o mais ocupado é %s, com %d%%).", m, used)
         out["space"] = (lv, msg, m)
+    # ---- Filas ERP: nível gravado na leitura; a frase sai dos números da janela ----
+    st = v("queue_st")
+    if st is None:
+        out["queue"] = (None, say("Sem dados das filas ERP."))
+    else:
+        lv = v("queue_lv")                       # erro/sem_tabela/vazia só têm nível se as filas já existiram
+        lv = None if lv is None else int(lv)
+        out["queue"] = (lv, queue_message(int(st), lv, r, say))
     return out
 
 
@@ -2308,18 +2433,19 @@ def window_row(kv, keys, disks, sample, ncpu):
             w = row["_fs_worst"] = space_worst(fs)[1]
             row["fs_worst_used"], row["fs_worst_free"], row["fs_worst_total"] = (
                 w["used_pct"], float(w["free_bytes"]), float(w["total_bytes"]))
+    row.update(queue_parse(kv))                      # v2.18+: filas ERP (sem leitura = sem as colunas)
     dg = diagnose(row, ncpu, disks)
     lvs = [dg[k][0] for k in RES_KEYS]
-    row["lv_cpu"], row["lv_mem"], row["lv_disk"], row["lv_space"] = (NAN if x is None else x for x in lvs)
+    row["lv_cpu"], row["lv_mem"], row["lv_disk"], row["lv_space"], row["lv_queue"] = (NAN if x is None else x for x in lvs)
     known = [x for x in lvs if x is not None]
     row["state"] = max(known) if known else NAN
     return row
 
 
 def perf_level(row):
-    """Pior nível só de CPU, memória e disco (desempenho). Ocupação de espaço muda devagar: não
+    """Pior nível de CPU, memória, disco e filas ERP (pressão). Ocupação de espaço muda devagar: não
     acelera o envio (interval_alert), só dispara envio quando o nível dela muda."""
-    known = [row[k] for k in ("lv_cpu", "lv_mem", "lv_disk") if row.get(k) is not None and row[k] == row[k]]
+    known = [row[k] for k in ("lv_cpu", "lv_mem", "lv_disk", "lv_queue") if row.get(k) is not None and row[k] == row[k]]
     return int(max(known)) if known else None
 
 
@@ -2429,6 +2555,7 @@ class History:
         self.tz_offset = None        # fuso do servidor (dos horários ISO do relatório)
         self.cutoff = None           # janelas antes disso vão só para o resumo por hora
         self.has_space = False       # o relatório tem ocupação de filesystems (v2.3+)
+        self.has_queue = False       # o relatório tem filas ERP com nível (v2.18+; empresa com a Integração FV)
         self.fs_names = []           # pontos de montagem (coluna fs_worst_id = índice aqui)
         self.fs_ids = {}
         self.last_raw = None         # última linha DATA lida (bytes) e as linhas depois dela: permitem
@@ -2596,6 +2723,9 @@ class History:
                     i = self.fs_ids[w["mount"]] = len(self.fs_names)
                     self.fs_names.append(w["mount"])
                 row["fs_worst_id"] = float(i)
+        ql = row.get("queue_lv")
+        if ql is not None and ql == ql:
+            self.has_queue = True
         if not old:
             self.raw.add(ts, win, row)
         self.roll.add(ts, win, row)
@@ -3443,6 +3573,7 @@ class CloudSync:
         self.dir = os.path.join(self.base, SYNC_DIR)
         self.acfg = AgentConfig(os.path.join(self.dir, AGENT_CFG_FILE))   # frequências da central (v2.11)
         self.sql_info = {}                # editor SQL (v2.12): sql_cert_fp/sql_proto vão junto se info/<sid> for regravado
+        self.queues = None                # QueueReader (v2.18): detalhe das filas e limites no status (só no coletor)
         self.spool = os.path.join(self.dir, "spool")
         self.state_path = os.path.join(self.dir, "state.json")
         self.ram_path = state_ram_path(log)   # cópia de trabalho do estado, em RAM (None sem /dev/shm)
@@ -3984,11 +4115,12 @@ class CloudSync:
             ncpu = 1
         dg = diagnose(row, ncpu, disks, msgs=True)
         fs = row.get("_fs")                      # None = janela sem medição de espaço (Client < 2.3)
-        levels = {k: dg[k][0] for k in RES_KEYS if k != "space" or fs is not None}
+        # filas ERP só com nível (sem leitura, não implantadas ou com erro: o recurso não aparece)
+        levels = {k: dg[k][0] for k in RES_KEYS if (k != "space" or fs is not None) and (k != "queue" or dg[k][0] is not None)}
         known = [v for v in levels.values() if v is not None]
         lv = max(known) if known else None
-        # desempate: desempenho antes de espaço (que costuma durar dias)
-        main = next((k for k in ("disk", "cpu", "mem", "space") if lv and levels.get(k) == lv), None)
+        # desempate: desempenho antes das filas e do espaço (que costuma durar dias)
+        main = next((k for k in ("disk", "cpu", "mem", "queue", "space") if lv and levels.get(k) == lv), None)
         cfg = self.cfg_now()
         g = lambda k: None if row.get(k) is None or row.get(k) != row.get(k) else round(row.get(k), 2)
         dk = dg["disk"][2] if len(dg["disk"]) > 2 else None
@@ -4024,7 +4156,29 @@ class CloudSync:
         if fs is not None:                       # schema 2: ocupação de cada filesystem real
             doc["filesystems"] = [{k: f[k] for k in ("mount", "device", "fstype", "total_bytes", "free_bytes", "used_pct")}
                                   for f in fs[:FS_MAX]]
+        q = self.queue_doc(row, dg, t, float(kv.get("win") or 0))
+        if q:                                    # v2.18 (opcional): filas ERP da janela
+            doc["queues"] = q
         return clip(doc)
+
+    def queue_doc(self, row, dg, t, win):
+        """status/<sid>/queues: estado e totais das filas ERP na janela; o detalhe por fila e os limites aplicados vêm
+        da leitura da thread 'filas' que gerou a janela (só no coletor). None = janela sem leitura das filas."""
+        st = row.get("queue_st")
+        if st is None or st != st:
+            return None
+        g = lambda k: None if row.get(k) is None or row[k] != row[k] else int(row[k])
+        lv = dg["queue"][0]
+        d = {"state": QUEUE_STATES[int(st)], "message": dg["queue"][1], "read_age_s": g("queue_age"),
+             "not_queued": g("queue_nq"), "in_queues": g("queue_in"), "processed_today": g("queue_done"),
+             "oldest_wait_s": g("queue_wait"), "n_queues": g("queue_n"),
+             "pressure_pct": None if g("queue_pct") is None else round(row["queue_pct"], 1),
+             "level": None if lv is None else LEVEL_KEYS[lv]}
+        r = self.queues.last if self.queues is not None else None
+        if r is not None and abs(r["at"] - t) <= max(win, 30) + 15 and r["state"] == d["state"]:
+            d.update(queues=r.get("queues") or None, limits=r["limits"], error_code=r.get("error_code"),
+                     error=r.get("error"))
+        return {k: v for k, v in d.items() if v is not None}
 
     def cfg_now(self, t=None):
         """Configuração de envio vigente: a local (sync_cfg) com as frequências da central na faixa de horário atual."""
@@ -4051,8 +4205,14 @@ class CloudSync:
         g = lambda k: None if row.get(k) is None or row.get(k) != row.get(k) else round(row.get(k), 2)
         keys = {"cpu": ("cpu_avg", "cpu_max", "rq_avg", "psi_cpu", "st_avg", "hot_avg"),
                 "mem": ("mem_avg", "mem_max", "swio", "psi_mem", "psi_mem_full"),
-                "disk": ("psi_io", "psi_io_full"), "space": ("fs_used_max",)}[res]
+                "disk": ("psi_io", "psi_io_full"), "space": ("fs_used_max",),
+                "queue": ()}[res]
         m = {k: g(k) for k in keys}
+        if res == "queue":                       # filas ERP (v2.18): totais da janela que mudou o nível
+            m.update({n: g(k) for k, n in (("queue_in", "in_queues"), ("queue_nq", "not_queued"),
+                                           ("queue_wait", "oldest_wait_s"), ("queue_age", "read_age_s"),
+                                           ("queue_done", "processed_today"), ("queue_n", "n_queues"),
+                                           ("queue_pct", "pressure_pct"))})
         if res == "disk":
             for d in disks:
                 for k in ("util_avg", "await", "qd_avg", "iops_avg"):
@@ -4179,6 +4339,10 @@ def compact_row(row, kv, disks):
     ls = row.get("lv_space")
     if ls is not None and ls == ls:
         d["ls"] = int(ls)
+    for k, short in (("lv_queue", "lq"), ("queue_in", "qi"), ("queue_nq", "qn"), ("queue_wait", "qw")):
+        v = row.get(k)                          # v2.18 (opcionais): filas ERP (nível e totais)
+        if v is not None and v == v:
+            d[short] = int(v)
     return d
 
 
@@ -4217,6 +4381,10 @@ def bucket_add(b, start, row, kv, disks):
         b["ls"] = int(v)
     if f is not None and f == f and (b.get("fsm") is None or f > b["fsm"]):
         b["fsm"] = f
+    for k, short in (("lv_queue", "lq"), ("queue_in", "qim"), ("queue_nq", "qnm"), ("queue_wait", "qwm")):
+        v = row.get(k)                          # filas ERP (v2.18): pior nível e picos do bloco
+        if v is not None and v == v and (b.get(short) is None or v > b[short]):
+            b[short] = int(v)
     return b
 
 
@@ -4230,7 +4398,7 @@ def bucket_doc(b):
     d.update(u=avg("u"), cm=x.get("cpu_max"), qm=x.get("rq_max"), mm=x.get("mem_max"), pim=x.get("psi_io_max"),
              pcm=x.get("psi_cpu_max"), um=x.get("um"), aw=round(x["aw"], 2) if x.get("aw") is not None else None,
              lv=b["lv"], n=b["n"], w=round(b["w"], 1))
-    for k in ("fsm", "ls"):
+    for k in ("fsm", "ls", "lq", "qim", "qnm", "qwm"):
         if b.get(k) is not None:
             d[k] = b[k]
     return d
@@ -4247,7 +4415,10 @@ AGENT_SCHEDULE_DEFAULT = ("12345", "6-20")   # horário comercial sem schedule: 
 AGENT_CFG_INTS = {("biz", "heartbeat_s"): (30, 3600), ("biz", "status_s"): (60, 3600),
                   ("off", "heartbeat_s"): (30, 3600), ("off", "status_s"): (60, 3600),
                   ("collect", "biz_interval_s"): (10, 300), ("collect", "interval_s"): (60, 3600),
-                  ("update", "interval_s"): (300, 86400)}
+                  ("update", "interval_s"): (300, 86400),
+                  # filas ERP (v2.18): limites da pressão (padrão QUEUE_DEFAULTS)
+                  ("queue", "in_queues"): (1, 10 ** 9), ("queue", "not_queued"): (1, 10 ** 9),
+                  ("queue", "wait_s"): (60, 7 * 86400), ("queue", "stale_s"): (30, 86400), ("queue", "crit_factor"): (2, 100)}
 AGENT_CFG_STRS = (("schedule", "days"), ("schedule", "hours"), ("collect", "biz_hours"), ("update", "window"))
 HOURS_RE = re.compile(r"^([0-9]|1[0-9]|2[0-3])-([0-9]|1[0-9]|2[0-4])$")
 
@@ -8317,6 +8488,184 @@ class SysEvents:
 
 
 # --------------------------------------------------------------------------
+# Filas ERP (v2.18; contrato em docs/CONTRATO_RTDB.md, "Filas ERP"): leitura de admin.monitor_filas
+# --------------------------------------------------------------------------
+QUEUE_LEAD = 3                     # s antes do fim da janela em que a thread 'filas' lê (a janela grava a foto recente)
+QUEUE_TIMEOUT_MS, QUEUE_LOCK_MS = 3000, 500   # statement_timeout / lock_timeout de cada leitura
+QUEUE_BACKOFF = (5, 300)           # s até conectar de novo depois de uma falha (dobra até o teto)
+QUEUE_WAIT = 10                    # s entre verificações sem acesso ao banco (desligado / configuração não lida)
+QUEUE_DETAIL = 20                  # filas detalhadas no status (as maiores)
+QUEUE_TYPE_MAX = 64                # caracteres do tipo do registro mais antigo
+QUEUE_APP = "c2_monitor_filas"     # application_name da conexão (identificável no pg_stat_activity)
+QUEUE_SEEN_FILE = "queues_seen.json"   # SYNC_DIR/queues_seen.json: a empresa já teve filas lidas (ok/leitura_parada);
+                                       # depois disso erro/sem_tabela/vazia = ATENÇÃO (filas perdidas). Nunca zera
+                                       # sozinho: só com a pasta do agente reinstalada (arquivo apagado)
+QUEUE_SQL_EXISTS = "SELECT 1 FROM pg_tables WHERE schemaname = 'admin' AND tablename = 'monitor_filas'"
+QUEUE_SQL_TOTALS = ("SELECT qtd_nao_enfileirado, qtd_em_fila, qtd_processado_dia, "
+                    "EXTRACT(EPOCH FROM (clock_timestamp() - data_leitura)) "
+                    "FROM admin.monitor_filas WHERE origem = 'INTEGRACAO_FV' AND id_fila = 0")
+# as maiores filas (detalhe) e, sobre todas, quantas são e a maior espera (janela calculada antes do LIMIT)
+QUEUE_SQL_QUEUES = ("SELECT id_fila, qtd_em_fila, EXTRACT(EPOCH FROM (clock_timestamp() - data_mais_antigo)), "
+                    "EXTRACT(EPOCH FROM (clock_timestamp() - data_mais_recente)), tipo_mais_antigo, count(*) OVER (), "
+                    "max(EXTRACT(EPOCH FROM (clock_timestamp() - data_mais_antigo))) OVER () "
+                    "FROM admin.monitor_filas WHERE origem = 'INTEGRACAO_FV' AND id_fila > 0 "
+                    "ORDER BY qtd_em_fila DESC, id_fila LIMIT %d" % QUEUE_DETAIL)
+
+
+def queue_num(v):
+    """Valor do banco (texto) -> inteiro >= 0; None se nulo/ilegível."""
+    try:
+        return max(0, int(round(float(v))))
+    except (TypeError, ValueError):
+        return None
+
+
+class QueueReader:
+    """Thread 'filas' (v2.18): uma leitura de admin.monitor_filas por janela, QUEUE_LEAD s antes do fim dela.
+    Conexão própria (QUEUE_APP, com a configuração do DbAgent) mantida aberta enquanto der certo; transação
+    REPEATABLE READ READ ONLY (totais e filas da mesma foto) com statement_timeout e lock_timeout curtos; nunca grava
+    nada no banco. Só com sync.db_access e a configuração já lida pelo DbAgent; sem isso não há leitura (a janela sai
+    sem os campos das filas). Tabela ausente (sem_tabela) ou sem a linha de totais (vazia) não são erro; falha =
+    estado erro e nova conexão com espera crescente (QUEUE_BACKOFF). A coleta só chama take() (sem banco nem rede).
+    O nível é calculado aqui, com os limites vigentes (agent_config, seção queue; padrão QUEUE_DEFAULTS). Empresa que
+    já teve filas lidas (path = SYNC_DIR/queues_seen.json) e passa a erro/sem_tabela/vazia = ATENÇÃO (filas perdidas)."""
+
+    def __init__(self, db, boundary, acfg=None, out=None, path=None):
+        self.db, self.ident, self.boundary, self.acfg, self.out = db, db.ident, boundary, acfg, out
+        self.path = path
+        self.seen = bool((read_json(path) or {}).get("seen_at")) if path else False
+        self.stop_ev = threading.Event()
+        self.thread = self.pg = self.pg_key = None
+        self.lock = threading.Lock()
+        self.last = None                  # última leitura: state, totais, queues, at, lv, pct, limits
+        self.err = {"state": "erro"}      # último erro (repetido nas janelas enquanto espera para conectar de novo)
+        self.fails, self.retry_at = 0, 0.0
+
+    def start(self):
+        self.thread = threading.Thread(target=self.loop, name="filas", daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_ev.set()
+        if self.thread is not None and self.thread is not threading.current_thread():
+            self.thread.join(5)
+        self.close_pg()
+
+    def close_pg(self):
+        if self.pg is not None:
+            self.pg.close()
+            self.pg = None
+
+    def limits(self):
+        get = (lambda k, d: self.acfg.get("queue", k, d)) if self.acfg is not None else None
+        return queue_limits(get)
+
+    def take(self, max_age):
+        """Última leitura (cópia) com no máximo max_age s; None = sem dado (a janela sai sem os campos das filas)."""
+        with self.lock:
+            r = self.last
+        return dict(r) if r is not None and time.time() - r["at"] <= max_age else None
+
+    def set(self, r):
+        lim = self.limits()
+        r = dict(r, at=time.time(), limits=lim)
+        r["lv"], r["pct"] = queue_level(r, lim)
+        if r["state"] in ("ok", "leitura_parada"):
+            if not self.seen:
+                self.mark_seen()
+        elif self.seen:
+            r["lv"] = 1                                   # filas que existiam sumiram ou não são lidas: ATENÇÃO
+        with self.lock:
+            self.last = r
+        return r
+
+    def mark_seen(self):
+        """1ª leitura com filas: grava o marcador (falha de disco = só em memória, tenta de novo na próxima)."""
+        if self.path is None:
+            self.seen = True
+            return
+        try:
+            os.makedirs(os.path.dirname(self.path), mode=0o700, exist_ok=True)
+            write_private(self.path, json.dumps({"seen_at": int(time.time())}))
+            self.seen = True
+        except OSError:
+            pass
+
+    def loop(self):
+        nxt = 0.0
+        while not self.stop_ev.is_set():
+            wait = nxt - time.time()
+            if wait > 0:
+                self.stop_ev.wait(min(wait, QUEUE_WAIT))
+                continue
+            try:
+                self.step()
+            except Exception as e:                        # nunca derruba a thread
+                self.close_pg()
+                self.set({"state": "erro", "error_code": "interno", "error": "erro interno: %s" % type(e).__name__})
+            # próxima: QUEUE_LEAD s antes do fim da próxima janela (nunca a mesma)
+            nxt = self.boundary(time.time() + QUEUE_LEAD + 1) - QUEUE_LEAD
+
+    def step(self):
+        """Uma leitura. Devolve desligado | o estado lido (ok, leitura_parada, vazia, sem_tabela, erro)."""
+        c = self.db.cfg
+        if not self.ident.sync_cfg()["db_access"] or c is None:
+            self.close_pg()
+            with self.lock:
+                self.last = None
+            return "desligado"
+        key = tuple(c.get(k) for k in ("host", "port", "dbname", "user", "password", "sslmode"))
+        if key != self.pg_key:                            # configuração nova: conecta de novo, sem espera
+            self.close_pg()
+            self.pg_key, self.fails, self.retry_at = key, 0, 0.0
+        if self.pg is None and time.time() < self.retry_at:
+            return self.set(self.err)["state"]            # esperando para conectar de novo: a janela registra o erro
+        try:
+            r = self.read(c)
+        except DbError as e:
+            self.close_pg()
+            self.fails += 1
+            self.retry_at = time.time() + min(QUEUE_BACKOFF[1], QUEUE_BACKOFF[0] * 2 ** (self.fails - 1))
+            code = SysEvents.db_code(e)
+            self.err = {"state": "erro", "error_code": code if re.match(r"^[a-z_]{1,64}$", code) else "interno",
+                        "error": clip(str(e), 500)}
+            return self.set(self.err)["state"]
+        self.fails = 0
+        return self.set(r)["state"]
+
+    def read(self, c):
+        if self.pg is None:
+            self.pg = PgConn(c.get("host"), c.get("port"), c.get("dbname") or "", c.get("user") or "",
+                             c.get("password") or "", c.get("sslmode"), timeout=10, app=QUEUE_APP)
+            self.pg.sock.settimeout(QUEUE_TIMEOUT_MS / 1000.0 + 5)
+        pg = self.pg
+        pg.simple("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL statement_timeout = %d; "
+                  "SET LOCAL lock_timeout = %d" % (QUEUE_TIMEOUT_MS, QUEUE_LOCK_MS))
+        r = {"state": "sem_tabela"}
+        if pg.query(QUEUE_SQL_EXISTS, [], 1)[2]:
+            tot = pg.query(QUEUE_SQL_TOTALS, [], 1)[2]
+            if not tot:
+                r = {"state": "vazia"}
+            else:
+                nq, qi, done, age = (queue_num(x) for x in tot[0])
+                rows = pg.query(QUEUE_SQL_QUEUES, [], QUEUE_DETAIL)[2]
+                r = {"state": "leitura_parada" if age is not None and age > self.limits()["stale_s"] else "ok",
+                     "not_queued": nq or 0, "in": qi or 0, "done": done or 0, "age": age,
+                     "n": queue_num(rows[0][5]) if rows else 0, "wait": queue_num(rows[0][6]) if rows else None,
+                     "queues": {}}
+                for row in rows:
+                    fid = queue_num(row[0])
+                    if fid is None:
+                        continue
+                    f = {"count": queue_num(row[1]) or 0, "oldest_wait_s": queue_num(row[2]),
+                         "newest_age_s": queue_num(row[3]),
+                         "oldest_type": clip(str(row[4]).strip(), QUEUE_TYPE_MAX) if row[4] is not None else None}
+                    r["queues"]["f%d" % fid] = {k: v for k, v in f.items() if v is not None and v != ""}
+        pg.simple("ROLLBACK")
+        return r
+
+
+# --------------------------------------------------------------------------
 # Profile do banco (v2.16; contrato em docs/PROFILER_BANCO.md)
 # --------------------------------------------------------------------------
 PROF_INBOX = "prof"                # db_requests/{sid}/prof/{rid}: pedidos da central (mesma escuta do DbAgent)
@@ -11448,8 +11797,8 @@ def cloud_pull(a, script_dir):
 # --------------------------------------------------------------------------
 PERIODS = [("1", "1h", 3600), ("2", "6h", 6 * 3600), ("3", "24h", 86400), ("4", "7d", 7 * 86400), ("5", "tudo", None)]
 LEVEL_NAMES = ["NORMAL", "ATENÇÃO", "CRÍTICO"]
-RESOURCES = [("cpu", "CPU"), ("mem", "MEMÓRIA"), ("disk", "DISCO"), ("space", "ESPAÇO")]
-RES_NAME = {"cpu": "CPU", "mem": "Memória", "disk": "Disco", "space": "Espaço"}
+RESOURCES = [("cpu", "CPU"), ("mem", "MEMÓRIA"), ("disk", "DISCO"), ("space", "ESPAÇO"), ("queue", "FILAS")]
+RES_NAME = {"cpu": "CPU", "mem": "Memória", "disk": "Disco", "space": "Espaço", "queue": "Filas"}
 PERIOD_TITLES = ["ÚLTIMA HORA", "ÚLTIMAS 6 HORAS", "ÚLTIMAS 24 HORAS", "ÚLTIMOS 7 DIAS", "TODO O HISTÓRICO"]
 
 HELP = """\
@@ -11483,6 +11832,13 @@ CRITÉRIOS
   ESPAÇO   ocupação de cada filesystem (/, /var, /home...; vale o pior):
            crítico: >= 95% ocupado ou < 1 GB livre; atenção: >= 85% ou < 5 GB livres
            (os limites em GB só valem para filesystems de 10 GB ou mais)
+  FILAS    filas ERP da Integração FV (admin.monitor_filas, gravada pelo SocketServer; só
+           aparece nas empresas que a têm). Limites padrão, ajustáveis na central:
+           atenção: > 2.000 nas filas, > 20.000 não enfileirados, registro esperando
+           > 30 min, ou leitura do SocketServer parada há > 120 s (números não confiáveis)
+           crítico: quantidade alta E espera longa juntas, ou o dobro do limite
+           (barra = % do limite mais próximo; processados no dia não contam)
+           empresa que já teve filas e passa a falhar na leitura/perde a tabela: atenção
   "% ocupado" do disco é o tempo com I/O em andamento, não a capacidade: um storage com
   vários discos/SSD pode estar 100% ocupado e ainda ter folga. Por isso CRÍTICO exige
   espera, fila ou latência. Cache do Linux não conta como memória usada.
@@ -12315,8 +12671,9 @@ class Dashboard:
 
     def res_list(self):
         """Recursos mostrados: ESPAÇO só aparece quando o relatório tem ocupação de filesystems
-        (relatórios anteriores à v2.3 mantêm o layout de três blocos)."""
-        return [r for r in RESOURCES if r[0] != "space" or self.hist.has_space]
+        (relatórios anteriores à v2.3 mantêm o layout de três blocos); FILAS só quando a empresa tem as filas ERP
+        (alguma janela com nível: admin.monitor_filas lida com a linha de totais)."""
+        return [r for r in RESOURCES if (r[0] != "space" or self.hist.has_space) and (r[0] != "queue" or self.hist.has_queue)]
 
     def res_block(self, y, x, w, ch, k, name, d, v):
         A, G = self.A, self.g
@@ -12333,11 +12690,18 @@ class Dashboard:
         elif k == "space":
             f = (self.hist.last or {}).get("_fs_worst")
             val, txt = (f["used_pct"] if f else None), "ocupado"
+        elif k == "queue":                        # % do limite mais próximo de ser ultrapassado
+            last = self.hist.last or {}
+            qp = last.get("queue_pct")
+            val, txt = (None if qp is None or qp != qp else qp), "do limite"
         else:
             val, txt = (v.get(dk) or {}).get("u"), "do tempo ocupado"
         title = name + ("  " + dk if k == "disk" and dk else "")
         if k == "space" and f:
             title += "  %s · %s livres" % (f["mount"], fmt_bytes(f["free_bytes"]))
+        if k == "queue" and val is not None:
+            title += " ERP  %s nas filas · %s não enfileirados" % (
+                fmt_int(last.get("queue_in") or 0), fmt_int(last.get("queue_nq") or 0))
         if ch < 0:                                # caixa mínima: valor no título, só a frase dentro
             title += " · %s %s" % (fmt_val(val, "%") if val is not None else "NA", txt)
         self.box_top(y, x, w, title, lab, border=border,
@@ -12356,7 +12720,7 @@ class Dashboard:
         if ch:
             keys = {"cpu": ("cpu_avg", "cpu_max"), "mem": ("mem_avg", "mem_max"),
                     "disk": ((dk or "?") + ".util_avg", (dk or "?") + ".util_max"),
-                    "space": ("fs_worst_used", "fs_worst_used")}[k]
+                    "space": ("fs_worst_used", "fs_worst_used"), "queue": ("queue_pct", "queue_pct")}[k]
             lvm = self.chart(yy, x, ch, w, keys[0], keys[1], labels=False, axis=False, lv_key="lv_" + k) or []
             for c, l in enumerate(lvm):
                 if l is not None and l >= 1:
@@ -14114,6 +14478,9 @@ def main():
             mon.sysev = SysEvents(cloud, mon.db, out=mon.say)  # eventos do sistema: mesma conexão do DbAgent
             mon.sql = SqlEditor(cloud, mon.db, out=mon.say)    # editor SQL: pedidos pela mesma escuta do DbAgent
             mon.prof = Profiler(cloud, mon.db, out=mon.say)    # profile do banco: idem
+            # filas ERP (v2.18): uma leitura por janela, com a configuração do DbAgent e os limites da central
+            mon.queues = cloud.queues = QueueReader(mon.db, mon.next_boundary, cloud.acfg, out=mon.say,
+                                                    path=os.path.join(cloud.dir, QUEUE_SEEN_FILE))
     # autoatualização: só o coletor; ao gravar a versão nova para a coleta e o laço abaixo sai para reiniciar
     mon.updater = Updater(os.path.abspath(__file__), ident.sync_cfg(), out=mon.say, on_restart=mon.stop_ev.set)
     mon.updater.acfg = cloud.acfg                         # intervalo e janela da autoatualização (central)
@@ -14154,6 +14521,10 @@ def main():
             print("Profile do banco (pedido pela central): %s." % (
                 "disponível junto com o acesso ao banco" if c["db_profiler"] and c["db_access"]
                 else "DESLIGADO (sync.%s)" % ("db_profiler" if not c["db_profiler"] else "db_access")))
+        if mon.queues is not None:
+            mon.queues.start()
+            print("Filas ERP (admin.monitor_filas): %s." % ("lidas a cada janela junto com o acesso ao banco"
+                                                           if ident.sync_cfg()["db_access"] else "DESLIGADAS (sync.db_access)"))
         if mon.sysev is not None:
             mon.sysev.start()
             c = ident.sync_cfg()
