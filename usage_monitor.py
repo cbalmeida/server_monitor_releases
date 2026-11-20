@@ -52,6 +52,7 @@ try:
 except ImportError:
     fcntl = None
 import getpass
+import glob
 import gzip
 import hashlib
 import hmac
@@ -101,7 +102,7 @@ except ImportError:
 from array import array
 from xml.sax.saxutils import escape as xml_escape
 
-VERSION = "2.15.1"
+VERSION = "2.17.0"
 # Projeto Firebase da C2 (padrão do --firebase-setup). Não são segredos: a URL só identifica o banco e
 # a chave só identifica o projeto (restrita às APIs de login); o acesso é decidido pelas regras.
 FIREBASE_DB_URL = "https://c2-server-monitor-default-rtdb.firebaseio.com"
@@ -1571,6 +1572,7 @@ class Monitor:
         self.updater = None             # Updater (autoatualização), só no coletor
         self.db = None                  # DbAgent (acesso remoto ao Postgres), só no coletor com Firebase
         self.sysev = None               # SysEvents (eventos do sistema: admin.system_email), junto com o DbAgent
+        self.prof = None                # Profiler (profile do banco pedido pela central), junto com o DbAgent
         self.sql = None                 # SqlEditor (editor SQL remoto, v2.12), junto com o DbAgent
 
     def say(self, s):
@@ -1943,6 +1945,8 @@ class Monitor:
             self.updater.stop()
         if self.sysev is not None:
             self.sysev.stop()
+        if self.prof is not None:
+            self.prof.stop()
         if self.sql is not None:
             self.sql.stop()
         if self.db is not None:
@@ -2749,6 +2753,8 @@ class Identity:
         cfg["state_disk_interval"] = max(60, cfg["state_disk_interval"])
         cfg["sys_events_interval"] = max(60, cfg["sys_events_interval"])
         cfg["sys_events_retention_days"] = max(1, cfg["sys_events_retention_days"])
+        cfg["prof_keep"] = max(1, cfg["prof_keep"])
+        cfg["prof_days"] = max(1, cfg["prof_days"])
         return cfg
 
     @property
@@ -3038,6 +3044,9 @@ SYNC_DEFAULTS = {
     "sys_events_retention_days": 30,   # dias de eventos do sistema no Firebase (poda diária pelo last_at)
     "sql_editor": True,          # editor SQL remoto da central (v2.12, só leitura; exige db_access)
     "service": True,             # v2.13: o coletor se registra para iniciar com o sistema (systemd/cron; tarefa no Windows)
+    "db_profiler": True,         # v2.16: profile do banco pedido pela central (prof_*; exige db_access)
+    "prof_keep": 20,             # sessões de profile mantidas (Firebase e cópia local)
+    "prof_days": 180,            # dias máximos de um profile no Firebase/cópia local
 }
 HIST_MIN_GAP = 600               # mudança de estado só antecipa o histórico se o último envio tiver > 10 min
 HB_POLL = 5                      # s entre verificações da thread do heartbeat
@@ -4856,6 +4865,25 @@ SSE_TIMEOUT = 90                # s sem nenhum byte (o Firebase manda keep-alive
 SSE_RENEW = 300                 # s antes do token vencer: reconecta a escuta com um token novo
 SSE_BACKOFF, SSE_BACKOFF_MAX = 5, 300
 SSE_MAX_BUF = 8 << 20
+DB_VERS_RESEND = 21600          # s: db_versions/{sid} regravado (checked_at) mesmo sem mudança (v2.17)
+DB_VERS_TIMEOUT_MS = 5000       # statement_timeout das consultas de versão
+DB_VERS_DAYS = 15               # janela das conexões Android (mesma de admin.f_busca_versao_app_usr)
+DB_VERS_MAX = 20                # versões em uso publicadas (as maiores); o resto vai somado em in_use_other
+DB_VERS_APPS = 16               # aplicativos (APK) publicados no máximo
+DB_VERS_PARMS = ("VERSAO_DATASERVER", "VERSAO_SOCKET_SERVER", "DIR_AFV_LOCAL")
+DB_VERS_Q_PARMS = "SELECT nome, valor FROM admin.parm_sist WHERE nome IN ('%s')" % "', '".join(DB_VERS_PARMS)
+# por usuário, a versão mais recente do app Android nos últimos DB_VERS_DAYS dias: GREATEST da última conexão
+# permanente (ver_app) e da última conexão (ver_appc), como admin.f_busca_versao_app_usr; versão → nº de usuários
+DB_VERS_Q_IN_USE = (
+    "WITH c AS (SELECT DISTINCT ON (cod_usr) cod_usr, ver_appc AS v FROM admin.conx"
+    " WHERE data_ini > CURRENT_DATE - %(d)d AND modl_equip = 'Android' ORDER BY cod_usr, cod_conx DESC),"
+    " p AS (SELECT DISTINCT ON (cod_usr) cod_usr, ver_app AS v FROM admin.conx_permanente_conx_master"
+    " WHERE data_ini > CURRENT_DATE - %(d)d AND modl_equip = 'Android' ORDER BY cod_usr, cod_conx_permanente DESC),"
+    " u AS (SELECT GREATEST(COALESCE(trunc(c.v), 0), COALESCE(trunc(p.v), 0)) AS v FROM c FULL JOIN p USING (cod_usr))"
+    " SELECT v::bigint AS versao, count(*) AS usuarios FROM u WHERE v > 0 AND v < 1e12 GROUP BY v ORDER BY v DESC"
+    % {"d": DB_VERS_DAYS})
+APK_RE = re.compile(r"^c2tecnologia\.([a-z0-9]{1,32})_([0-9]{1,12})\.apk$", re.I)
+APK_SUBDIR = ("Bases", "E1", "installAndroid")      # <DIR_AFV_LOCAL>/Bases/E1/installAndroid (SocketServer)
 DB_ERROR_CODES = ("desligado", "sem_chave", "catalogo_invalido", "operacao_desconhecida", "parametro_invalido",
                   "expirado", "conexao", "autenticacao", "sql", "tempo_esgotado", "limite_linhas",
                   "resposta_grande", "interno")
@@ -5498,6 +5526,55 @@ def db_panel_text(doc, now=None):
     return txt, doc.get("kind", "")
 
 
+def apk_dir(dir_afv):
+    """<DIR_AFV_LOCAL>/Bases/E1/installAndroid com as barras do sistema local (o parâmetro vem com \\)."""
+    base = dir_afv.strip().replace("\\", "/").rstrip("/").replace("/", os.sep)
+    if not base or base.endswith(":"):                # "/" ou "D:\\" (D:Bases seria relativo à pasta atual de D:)
+        base += os.sep
+    return os.path.join(base, *APK_SUBDIR)
+
+
+def apk_scan(dir_afv):
+    """(apk_status, pasta, {app: {"version", "file"}}): maior versão de cada c2tecnologia.<app>_<NNNN>.apk.
+    Só lista a pasta (nada é lido); pasta de outra máquina (ex.: D:\\AFV num Linux) = pasta_inacessivel."""
+    if not dir_afv or not dir_afv.strip():
+        return "sem_parametro", "", {}
+    d = apk_dir(dir_afv)
+    try:
+        if not os.path.isabs(d):                      # D:/AFV/... num Linux: relativo, nunca a pasta certa
+            raise OSError(d)
+        names = os.listdir(d)
+    except OSError:
+        return "pasta_inacessivel", d, {}
+    apps = {}
+    for name in names:
+        m = APK_RE.match(name)
+        if m:
+            app, ver = m.group(1).lower(), int(m.group(2))
+            if app not in apps or ver > apps[app]["version"]:
+                apps[app] = {"version": ver, "file": clip(name, 128)}
+    if not apps:
+        return "sem_apk", d, {}
+    keep = sorted(apps, key=lambda a: (-apps[a]["version"], a))[:DB_VERS_APPS]
+    return "ok", d, {a: apps[a] for a in sorted(keep)}
+
+
+def in_use_doc(rows):
+    """Linhas (versão, usuários) da consulta → in_use {"v<versão>": n} (as DB_VERS_MAX maiores) + in_use_other."""
+    doc, other = {}, 0
+    for ver, n in rows:
+        if ver is None or n is None or not str(ver).isdigit() or not str(n).isdigit():
+            continue
+        if len(doc) < DB_VERS_MAX:
+            doc["v" + str(int(ver))] = int(n)
+        else:
+            other += int(n)
+    out = {"in_use": doc} if doc else {}
+    if other:
+        out["in_use_other"] = other
+    return out
+
+
 class DbAgent:
     """Acesso remoto ao Postgres local. Duas threads, sem tocar na coleta nem no heartbeat:
 
@@ -5546,6 +5623,8 @@ class DbAgent:
         self.test_pending = False         # testar a conexão (configuração nova)
         self.shm_lock = threading.Lock()
         self.sql = None                   # SqlEditor (v2.12): recebe os pedidos de sessão desta mesma escuta
+        self.prof = None                  # Profiler (v2.16): recebe os pedidos de profile desta mesma escuta
+        self.vers_sent, self.vers_at = None, 0.0   # db_versions (v2.17): último documento gravado e quando
 
     # ---- ciclo de vida ----
     def start(self):
@@ -5625,6 +5704,8 @@ class DbAgent:
                     self.publish_status()
                 except CloudError:
                     self.status_sent = None               # tenta de novo na próxima vez
+                if self.enabled:
+                    self.publish_versions()
         self.save_shm()
 
     def load_config(self):
@@ -5833,10 +5914,13 @@ class DbAgent:
         if self.sql is not None:                          # editor SQL (v2.12): pedidos em db_requests/{sid}/sql
             inbox = self.pending.get(SQL_INBOX)
             self.sql.inbox(dict(inbox) if isinstance(inbox, dict) else {})
+        if self.prof is not None:                         # profile do banco (v2.16): db_requests/{sid}/prof
+            inbox = self.pending.get(PROF_INBOX)
+            self.prof.inbox(dict(inbox) if isinstance(inbox, dict) else {})
         for rid in sorted(self.pending):
             if self.stop_ev.is_set():
                 break
-            if rid not in self.done and rid != SQL_INBOX:
+            if rid not in self.done and rid not in (SQL_INBOX, PROF_INBOX):
                 self.handle(rid, self.pending[rid])
 
     def answer(self, rid, op_id, params, at):
@@ -5999,6 +6083,52 @@ class DbAgent:
             return
         self.send_patch({"db_status/" + self.sid: dict(doc, checked_at={".sv": "timestamp"})})
         self.status_sent = doc
+
+    # ---- versões do dicionário e do Força de Vendas: db_versions (v2.17) ----
+    def versions_doc(self):
+        """Lê parm_sist, a pasta dos APKs e as versões em uso (READ ONLY). None = sem conexão (fica o último)."""
+        doc = {"agent_version": VERSION, "in_use_days": DB_VERS_DAYS}
+        try:
+            pg = self.conn()
+        except DbError:
+            return None
+        try:
+            pg.simple("BEGIN TRANSACTION READ ONLY; SET LOCAL statement_timeout = %d" % DB_VERS_TIMEOUT_MS)
+            parms = {r[0]: r[1] for r in pg.query(DB_VERS_Q_PARMS, [], 10)[2] if r[1] is not None}
+            for k, f in (("VERSAO_DATASERVER", "dataserver"), ("VERSAO_SOCKET_SERVER", "socket_server")):
+                if parms.get(k, "").strip():
+                    doc[f] = clip(parms[k].strip(), 32)
+            st, d, apps = apk_scan(parms.get("DIR_AFV_LOCAL"))
+            doc["apk_status"] = st
+            if d:
+                doc["apk_dir"] = clip(d, 260)
+            if apps:
+                doc["apk"] = apps
+            doc.update(in_use_doc(pg.query(DB_VERS_Q_IN_USE, [], 200)[2]))
+            pg.simple("ROLLBACK")
+        except DbError as e:
+            if e.broken or e.code in ("conexao", "autenticacao"):
+                self.close_pg()
+            elif pg.tx != b"I":
+                try:
+                    pg.simple("ROLLBACK")
+                except DbError:
+                    self.close_pg()
+            doc.setdefault("apk_status", "erro")
+            doc.update(error_code=e.code if e.code in DB_ERROR_CODES else "interno", error=clip(str(e), 500))
+        return doc
+
+    def publish_versions(self):
+        """No ciclo de DB_REFRESH: grava db_versions/{sid} quando o conteúdo muda ou a cada DB_VERS_RESEND."""
+        doc = self.versions_doc()
+        if doc is None or (doc == self.vers_sent and time.time() - self.vers_at < DB_VERS_RESEND):
+            return
+        try:
+            self.send_patch({"db_versions/" + self.sid: dict(doc, checked_at={".sv": "timestamp"})})
+        except CloudError:
+            self.vers_sent = None
+            return
+        self.vers_sent, self.vers_at = doc, time.time()
 
     def panel(self):
         """Estado para a linha do painel: {"text", "kind" (ok|erro|aviso), "last_req_at"}; {} = sem linha."""
@@ -8181,6 +8311,2339 @@ class SysEvents:
         except CloudError:
             self.next_prune = time.time() + 3600
             return
+        self.st["pruned_at"] = time.time()
+        self.next_prune = self.st["pruned_at"] + 86400
+        self.save()
+
+
+# --------------------------------------------------------------------------
+# Profile do banco (v2.16; contrato em docs/PROFILER_BANCO.md)
+# --------------------------------------------------------------------------
+PROF_INBOX = "prof"                # db_requests/{sid}/prof/{rid}: pedidos da central (mesma escuta do DbAgent)
+PROF_FILE = "profiler.json"        # estado local (SYNC_DIR, atômico, 600): sessão ativa, encerradas, respostas
+PROF_DIR = "prof"                  # SYNC_DIR/prof/<pid>/ (fotos e atividade) e SYNC_DIR/prof/<pid>.json.gz (relatório)
+PROF_AUDIT_FILE = "server_monitor_prof_audit.log"   # auditoria local: uma linha JSON por pedido/transição (600)
+PROF_APP = "c2_profiler"           # application_name das conexões do profiler (as amostras ignoram a si mesmas)
+PROF_TAG = "/* c2prof:%s */ "      # prefixo de toda consulta do profiler: identificável no log/pg_stat_statements
+PROF_DURATIONS = (15, 30, 60, 120, 180, 360, 720, 1440)     # minutos aceitos (máximo 24 h)
+PROF_PERFIS = ("leve", "detalhado")
+PROF_ACOES = ("iniciar", "interromper", "verificar")
+PROF_SAMPLE = {"leve": 15, "detalhado": 5}   # s entre amostras do pg_stat_activity
+PROF_SAMPLE_MAX = 60               # s: teto do intervalo depois de dobrar por overhead
+PROF_SNAP_MIN, PROF_SNAP_MAX = 300, 3600     # fotos a cada duração/6, entre 5 min e 1 h
+PROF_PROGRESS_S = 60               # s entre gravações do progresso em prof_sessions
+PROF_SAVE_S = 300                  # s entre cópias dos agregados da atividade para o disco
+PROF_READY_EVERY = 6 * 3600        # s entre verificações de prontidão (prof_state)
+PROF_EXPIRE = 60                   # s: iniciar/verificar mais velho que isso (hora do Firebase) é recusado
+PROF_SNAP_MS, PROF_SAMPLE_MS, PROF_EXPLAIN_MS, PROF_LOCK_MS = 10000, 3000, 5000, 200   # statement/lock_timeout
+PROF_LOCK_KEY = 0x633270726f66     # 'c2prof': trava advisory de sessão = um profiler por cluster PostgreSQL
+PROF_PART = 262144                 # caracteres base64 por parte em prof_reports
+PROF_MAX_PARTS = 64
+PROF_UP_PARTS = 4                  # partes por PATCH
+PROF_RETRY = (60, 900)             # s: espera após falha no envio (dobra até o teto)
+PROF_PRUNE_FIRST = 600             # s até a 1ª poda depois da partida
+PROF_ACK_KEEP = 86400              # s de prof_ack no Firebase
+PROF_MAX_STMTS, PROF_TOP = 500, 100
+PROF_QUERY_MAX = 20000             # caracteres de cada SQL no relatório
+PROF_FUNC_DEF_MAX, PROF_FUNC_TOTAL, PROF_FUNCS = 30000, 1 << 20, 100
+PROF_PLAN_MAX, PROF_PLANS = 50000, 15
+PROF_TABLES_MAX = 200
+PROF_ACT_MAX = 2000                # textos distintos guardados da amostragem (o resto vai para "outros")
+PROF_SNAP_DISK_MAX = 50 << 20      # bytes de fotos por sessão (excesso: descarta intermediárias, nunca início/fim)
+PROF_SLOWLOG_MAX = 20 << 20        # bytes lidos do log do PostgreSQL por sessão
+PROF_MD_RESUMO_MAX = 150000        # caracteres do Markdown resumido
+PROF_LONG_XACT = 300               # s: transação aberta há mais que isso é registrada
+PROF_SLOW_S = 1.0                  # s: consulta vista ativa por mais que isso conta como lenta
+PROF_CLOCK_JUMP = 300              # s de diferença relógio x monotônico = relógio ajustado (limitação)
+PROF_ID_RE = re.compile(r"^[0-9]{13}_[0-9a-z]{8}$")
+PROF_ERROR_CODES = ("desligado", "expirado", "pedido_invalido", "sessao_ativa", "conflito_cluster", "conexao",
+                    "autenticacao", "sem_permissao", "sessao_desconhecida", "parando", "interno")
+# parâmetros lidos na prontidão: os que decidem as fontes e os relevantes para a análise (memória, WAL, concorrência)
+PROF_SETTINGS = (
+    "shared_preload_libraries", "session_preload_libraries", "pg_stat_statements.max", "pg_stat_statements.track",
+    "pg_stat_statements.track_utility", "pg_stat_statements.save", "track_io_timing", "track_functions",
+    "track_activity_query_size", "track_counts", "log_min_duration_statement", "log_statement", "log_temp_files",
+    "log_lock_waits", "log_destination", "logging_collector", "log_directory", "log_filename", "data_directory",
+    "auto_explain.log_min_duration", "auto_explain.log_analyze", "server_version", "block_size", "max_connections",
+    "shared_buffers", "effective_cache_size", "work_mem", "maintenance_work_mem", "temp_buffers", "wal_buffers",
+    "random_page_cost", "seq_page_cost", "effective_io_concurrency", "default_statistics_target",
+    "checkpoint_timeout", "checkpoint_segments", "max_wal_size", "min_wal_size", "checkpoint_completion_target",
+    "synchronous_commit", "fsync", "full_page_writes", "wal_level", "commit_delay", "bgwriter_delay",
+    "bgwriter_lru_maxpages", "bgwriter_lru_multiplier", "autovacuum", "autovacuum_max_workers",
+    "autovacuum_naptime", "autovacuum_vacuum_scale_factor", "autovacuum_analyze_scale_factor",
+    "autovacuum_vacuum_cost_limit", "autovacuum_vacuum_cost_delay", "max_worker_processes",
+    "max_parallel_workers_per_gather", "max_parallel_workers", "jit", "huge_pages", "deadlock_timeout",
+    "lock_timeout", "statement_timeout", "idle_in_transaction_session_timeout", "max_locks_per_transaction",
+    "join_collapse_limit", "from_collapse_limit", "enable_seqscan", "enable_nestloop", "enable_hashjoin",
+    "server_encoding", "lc_collate", "TimeZone")
+# colunas do pg_stat_statements: nome lógico -> nomes por versão (o 1º que existir); contadores cumulativos
+PROF_PGSS = (("calls", ("calls",)), ("total_ms", ("total_exec_time", "total_time")), ("rows", ("rows",)),
+             ("shared_hit", ("shared_blks_hit",)), ("shared_read", ("shared_blks_read",)),
+             ("shared_dirtied", ("shared_blks_dirtied",)), ("shared_written", ("shared_blks_written",)),
+             ("local_hit", ("local_blks_hit",)), ("local_read", ("local_blks_read",)),
+             ("local_written", ("local_blks_written",)), ("temp_read", ("temp_blks_read",)),
+             ("temp_written", ("temp_blks_written",)), ("blk_read_ms", ("shared_blk_read_time", "blk_read_time")),
+             ("blk_write_ms", ("shared_blk_write_time", "blk_write_time")), ("temp_read_ms", ("temp_blk_read_time",)),
+             ("temp_write_ms", ("temp_blk_write_time",)), ("plans", ("plans",)), ("plan_ms", ("total_plan_time",)),
+             ("wal_records", ("wal_records",)), ("wal_fpi", ("wal_fpi",)), ("wal_bytes", ("wal_bytes",)))
+# não cumulativas (desde a criação da entrada, não só do período): só informativas
+PROF_PGSS_GAUGE = (("min_ms", ("min_exec_time", "min_time")), ("max_ms", ("max_exec_time", "max_time")))
+PROF_TAB_SQL = (
+    "SELECT s.relid::text, s.schemaname, s.relname, s.seq_scan, s.seq_tup_read, s.idx_scan, s.idx_tup_fetch, s.n_tup_ins, "
+    "s.n_tup_upd, s.n_tup_del, s.n_tup_hot_upd, s.vacuum_count, s.autovacuum_count, s.analyze_count, s.autoanalyze_count, "
+    "io.heap_blks_read, io.heap_blks_hit, io.idx_blks_read, io.idx_blks_hit, io.toast_blks_read, io.toast_blks_hit, "
+    "s.n_live_tup, s.n_dead_tup, s.n_mod_since_analyze, c.relpages, c.reltuples, s.last_vacuum::text, "
+    "s.last_autovacuum::text, s.last_analyze::text, s.last_autoanalyze::text "
+    "FROM pg_stat_user_tables s JOIN pg_statio_user_tables io ON io.relid = s.relid JOIN pg_class c ON c.oid = s.relid")
+PROF_TAB_COLS = ("relid", "schema", "name", "seq_scan", "seq_tup_read", "idx_scan", "idx_tup_fetch", "n_tup_ins",
+                 "n_tup_upd", "n_tup_del", "n_tup_hot_upd", "vacuum_count", "autovacuum_count", "analyze_count",
+                 "autoanalyze_count", "heap_blks_read", "heap_blks_hit", "idx_blks_read", "idx_blks_hit",
+                 "toast_blks_read", "toast_blks_hit", "n_live_tup", "n_dead_tup", "n_mod_since_analyze", "relpages",
+                 "reltuples", "last_vacuum", "last_autovacuum", "last_analyze", "last_autoanalyze")
+PROF_TAB_COUNTERS = PROF_TAB_COLS[3:21]
+PROF_IDX_SQL = (
+    "SELECT s.indexrelid::text, s.relid::text, s.indexrelname, s.idx_scan, s.idx_tup_read, s.idx_tup_fetch, "
+    "io.idx_blks_read, io.idx_blks_hit, c.relpages FROM pg_stat_user_indexes s "
+    "JOIN pg_statio_user_indexes io ON io.indexrelid = s.indexrelid JOIN pg_class c ON c.oid = s.indexrelid")
+PROF_IDX_COLS = ("indexrelid", "relid", "name", "idx_scan", "idx_tup_read", "idx_tup_fetch", "idx_blks_read",
+                 "idx_blks_hit", "relpages")
+PROF_IDX_COUNTERS = PROF_IDX_COLS[3:8]
+PROF_FN_SQL = "SELECT funcid::text, schemaname, funcname, calls, total_time, self_time FROM pg_stat_user_functions"
+PROF_FN_COLS = ("funcid", "schema", "name", "calls", "total_ms", "self_ms")
+PROF_FN_COUNTERS = PROF_FN_COLS[3:]
+PROF_DB_COUNTERS = ("xact_commit", "xact_rollback", "blks_read", "blks_hit", "tup_returned", "tup_fetched",
+                    "tup_inserted", "tup_updated", "tup_deleted", "conflicts", "temp_files", "temp_bytes", "deadlocks",
+                    "blk_read_time", "blk_write_time", "session_time", "active_time",
+                    "idle_in_transaction_time", "sessions_abandoned", "sessions_fatal", "sessions_killed")
+PROF_BGW_COUNTERS = ("checkpoints_timed", "checkpoints_req", "checkpoint_write_time", "checkpoint_sync_time",
+                     "buffers_checkpoint", "buffers_clean", "maxwritten_clean", "buffers_backend",
+                     "buffers_backend_fsync", "buffers_alloc", "num_timed", "num_requested", "write_time", "sync_time",
+                     "buffers_written")
+PROF_ACT_SQL = (
+    "SELECT pid::text, usename, application_name, datname, client_addr::text, state, wait_event_type, wait_event, "
+    "extract(epoch from (now() - xact_start)), extract(epoch from (now() - query_start)), "
+    "CASE WHEN wait_event_type = 'Lock' THEN pg_blocking_pids(pid)::text END, query%s "
+    "FROM pg_stat_activity WHERE pid <> pg_backend_pid()")
+PROF_RES_FIELDS = ("cpu_avg", "cpu_p95", "cpu_max", "hot_max", "iow_avg", "st_avg", "rq_avg", "rq_max", "load1",
+                   "psi_cpu", "mem_avg", "mem_max", "swap", "swin", "swout", "majf", "psi_mem", "psi_mem_full",
+                   "psi_io", "psi_io_full")
+PROF_RES_HOURLY = ("cpu_avg", "cpu_max", "iow_avg", "mem_avg", "swap", "psi_io")
+PROF_RES_DISK = re.compile(r"^([A-Za-z0-9_-]+)\.(util_avg|util_max|rMBs|wMBs|MBs_max|iops_avg|iops_max|riops|wiops|"
+                           r"await|r_await|w_await|qd_avg|qd_max)$")
+PROF_INSTRUCOES = """Você está recebendo um relatório técnico produzido pelo C2 Database Profiler.
+
+Analise o comportamento do banco PostgreSQL durante o período monitorado.
+
+Identifique os principais gargalos, priorizando consultas com maior impacto total, maior frequência, maior latência e maior consumo de recursos.
+
+Investigue oportunidades de melhoria nos SQLs, índices, tabelas, funções, estatísticas e configurações.
+
+Para cada recomendação, apresente:
+
+- Problema identificado.
+- Evidências do relatório.
+- Causa provável.
+- Grau de confiança.
+- SQL ou objeto afetado.
+- Alteração sugerida, incluindo SQL completo quando tecnicamente justificável.
+- Benefício esperado, sem inventar percentuais ou tempos.
+- Riscos e impactos.
+- Forma segura de validar a alteração.
+- Forma de reverter a alteração.
+
+Diferencie problemas comprovados, hipóteses e casos que exigem investigação adicional.
+
+Não recomende a criação de índices sem verificar os índices existentes.
+
+Não recomende a exclusão de índices apenas por baixa utilização.
+
+Considere o custo de escrita e manutenção dos índices.
+
+Não presuma que toda consulta lenta é consequência de índice ausente.
+
+Considere contenção, locks, estatísticas desatualizadas, I/O, concorrência, funções e limitações de hardware.
+
+Priorize as melhorias com maior probabilidade de reduzir o tempo total consumido pelo banco de dados.
+
+Não execute nenhuma alteração automaticamente."""
+
+_PROF_STR = re.compile(r"'(?:[^']|'')*'")
+_PROF_NUM = re.compile(r"\$\d+|\b\d+(?:\.\d+)?\b")
+_PROF_CMT = re.compile(r"/\*.*?\*/|--[^\n]*", re.S)
+_PROF_WS = re.compile(r"\s+")
+_PROF_WRITE = re.compile(r"\b(insert|update|delete|merge|copy|into|truncate|alter|create|drop|grant|revoke|lock|"
+                         r"vacuum|analyze|refresh|call|do|nextval|setval|for\s+(update|share|no\s+key|key))\b", re.I)
+_PROF_IDENT = re.compile(r"[a-z_][a-z0-9_$]*(?:\.[a-z_][a-z0-9_$]*)?")
+_PROF_CALL = re.compile(r"([a-z_][a-z0-9_$]*)\s*\(")
+_PROF_OWN = re.compile(r"^\s*(/\* c2prof|set (default_transaction_read_only = on|lock_timeout = %d|"
+                       r"statement_timeout = (%d|%d|%d))\s*$)" % (PROF_LOCK_MS, PROF_SNAP_MS, PROF_SAMPLE_MS,
+                                                                 PROF_EXPLAIN_MS), re.I)
+
+
+def prof_num(v):
+    """Texto do Postgres -> int/float (None se vazio ou não numérico)."""
+    if v is None or v == "":
+        return None
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return v
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        pass
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def prof_bool(v):
+    return v in ("t", "true", "on", "1", True)
+
+
+def prof_norm(q):
+    """Forma normalizada só para AGRUPAR (sem comentários; literais e $n viram ?; minúsculas): junta o texto visto
+    no pg_stat_activity (com valores) ao normalizado do pg_stat_statements e agrupa SQL dinâmico (EXECUTE '...' ||
+    valor gera um queryid por valor). O texto mostrado no relatório é sempre o original."""
+    q = _PROF_CMT.sub(" ", q or "")
+    q = _PROF_STR.sub("?", q)
+    q = _PROF_NUM.sub("?", q)
+    return _PROF_WS.sub(" ", q).strip().lower()
+
+
+def prof_key(q):
+    return hashlib.sha1(prof_norm(q).encode("utf-8")).hexdigest()[:16]
+
+
+def prof_explainable(q, limit):
+    """EXPLAIN (sem ANALYZE) só de SELECT/WITH completo (não cortado em track_activity_query_size), sem parâmetros
+    $n, sem nada que escreva ou trave linhas. O EXPLAIN não executa a consulta; a conexão é READ ONLY."""
+    s = _PROF_CMT.sub(" ", q or "").strip().rstrip(";").strip()
+    if not s or len(q) >= limit - 1 or ";" in _PROF_STR.sub("''", s) or re.search(r"\$\d", s):
+        return False
+    if not re.match(r"(?is)^(select|with)\b", s):
+        return False
+    return not _PROF_WRITE.search(_PROF_STR.sub("''", s))
+
+
+def prof_cut(text, n, what, lims):
+    """Corta texto com marca visível e registra a limitação (nunca corta em silêncio)."""
+    if text is None or len(text) <= n:
+        return text
+    if lims is not None:
+        lims.add("%s com mais de %d caracteres foram cortados (marcados no texto)" % (what, n))
+    return text[:n] + "\n[… cortado: %d caracteres]" % (len(text) - n)
+
+
+class ProfLims:
+    """Lista de limitações sem repetição, na ordem em que apareceram."""
+
+    def __init__(self, items=None):
+        self.items = list(items or [])
+
+    def add(self, s):
+        if s not in self.items:
+            self.items.append(s)
+
+
+def prof_resources(log, t0, t1):
+    """Recursos do servidor no período a partir das linhas DATA do relatório local (nada novo é lido do /proc):
+    média ponderada pela janela (win) e máximo de cada campo, discos, série por hora e as janelas de pico."""
+    try:
+        size = os.path.getsize(log)
+    except (OSError, TypeError):
+        return None
+    acc, disks, hours, peaks, n = {}, {}, {}, [], 0
+
+    def add(d, k, v, w):
+        a = d.setdefault(k, [0.0, 0.0, None])
+        a[0] += w
+        a[1] += v * w
+        a[2] = v if a[2] is None else max(a[2], v)
+
+    with open(log, "rb") as f:
+        f.seek(seek_ts(log, t0, size))
+        for raw in f:
+            if not raw.startswith(b"DATA "):
+                continue
+            kv = dict(p.split("=", 1) for p in raw.decode("utf-8", "replace").split()[1:] if "=" in p)
+            ts = iso_epoch(kv.get("ts"))
+            win = prof_num(kv.get("win")) or 0
+            if ts is None or ts <= t0:
+                continue
+            if ts - win >= t1:
+                break
+            n += 1
+            w = max(1, win)
+            hk = utc_iso(ts - ts % 3600)
+            for k, v in kv.items():
+                x = prof_num(v)
+                if x is None:
+                    continue
+                if k in PROF_RES_FIELDS:
+                    add(acc, k, x, w)
+                    if k in PROF_RES_HOURLY:
+                        add(hours.setdefault(hk, {}), k, x, w)
+                m = PROF_RES_DISK.match(k)
+                if m:
+                    add(disks.setdefault(m.group(1), {}), m.group(2), x, w)
+                    if m.group(2) == "util_max":
+                        add(hours.setdefault(hk, {}), "disk_util_max", x, w)
+            peaks.append((prof_num(kv.get("cpu_max")) or 0, kv.get("ts"),
+                          max([prof_num(v) or 0 for k, v in kv.items() if k.endswith(".util_max")] or [0]),
+                          prof_num(kv.get("psi_io")) or 0))
+    if not n:
+        return {"windows": 0}
+
+    def fin(d):
+        return {k: {"avg": round(a[1] / a[0], 2), "max": a[2]} for k, a in sorted(d.items()) if a[0]}
+
+    return {"windows": n, "fields": fin(acc), "disks": {d: fin(v) for d, v in sorted(disks.items())},
+            "hourly": [dict({"hora_utc": h}, **{k: v["max"] if k.endswith("max") else v["avg"] for k, v in fin(d).items()})
+                       for h, d in sorted(hours.items())],
+            "peaks_cpu": [{"ts": p[1], "cpu_max": p[0]} for p in sorted(peaks, key=lambda p: -p[0])[:5]],
+            "peaks_disk": [{"ts": p[1], "util_max": p[2], "psi_io": p[3]} for p in sorted(peaks, key=lambda p: (-p[2], -p[3]))[:5]]}
+
+
+def prof_delta(a, b, counters):
+    """Diferença b - a por chave entre duas fotos {"cols", "rows"}: chave nova em b = valor inteiro de b (criada no
+    período); algum contador que diminuiu = estatística zerada no meio (reset, despejo): vale o valor de b e a linha
+    sai marcada. Devolve {chave: (delta, nova, zerada)}."""
+    ia = {c: i for i, c in enumerate(a.get("cols") or [])}
+    ib = {c: i for i, c in enumerate(b.get("cols") or [])}
+    cs = [c for c in counters if c in ib]
+    out = {}
+    for k, rb in (b.get("rows") or {}).items():
+        ra = (a.get("rows") or {}).get(k)
+        reset = False
+        if ra is not None:
+            for c in cs:
+                va, vb = (prof_num(ra[ia[c]]) if c in ia else None), prof_num(rb[ib[c]])
+                if va is not None and vb is not None and vb < va:
+                    reset = True
+                    break
+        d = {}
+        for c in cs:
+            vb = prof_num(rb[ib[c]])
+            va = prof_num(ra[ia[c]]) if ra is not None and not reset and c in ia else None
+            d[c] = None if vb is None else vb - (va or 0)
+        out[k] = (d, ra is None, reset)
+    return out
+
+
+def prof_add(acc, k, d, new, reset):
+    cur = acc.get(k)
+    if cur is None:
+        acc[k] = [dict(d), new, reset]
+        return
+    for c, v in d.items():
+        if v is not None:
+            cur[0][c] = (cur[0].get(c) or 0) + v
+    cur[2] = cur[2] or reset
+
+
+def prof_md_cell(v):
+    s = "" if v is None else (("%.2f" % v).rstrip("0").rstrip(".") if isinstance(v, float) else str(v))
+    return s.replace("|", "\\|").replace("\n", " ")
+
+
+def prof_md_table(head, rows):
+    out = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+    out += ["| " + " | ".join(prof_md_cell(c) for c in r) + " |" for r in rows]
+    return "\n".join(out)
+
+
+def prof_fence(text, lang="sql"):
+    t = text or ""
+    tick = "```"
+    while tick in t:
+        tick += "`"
+    return "%s%s\n%s\n%s" % (tick, lang, t, tick)
+
+
+class ProfReport:
+    """Consolidação do profile (só no agente; a central mostra e copia o que vem, sem regra duplicada): SQLs com as
+    diferenças do período, rankings, potencial de melhoria (heurístico, com os critérios), tabelas/índices/funções
+    envolvidos, alertas, resumo e o Markdown completo e resumido. Não acessa o banco: recebe o que foi coletado."""
+
+    def __init__(self, ident, lims, sources, settings, block_size=8192):
+        self.ident, self.lims, self.sources, self.settings = ident, lims, sources, settings
+        self.block = block_size or 8192
+        self.stmts, self.groups, self.rankings, self.alerts = [], [], {}, []
+        self.tables, self.functions, self.plans, self.slow_log, self.remessas = [], [], [], [], []
+        self.activity, self.database, self.resources, self.hourly = {}, {}, None, []
+        self.totals = {"sql_distintos": 0, "execucoes": None, "total_ms": None}
+        self.by_key = {}
+
+    # ---- SQLs ----
+    def set_statements(self, acc, texts, meta, names, own_user, seen, tindex, plan_keys):
+        """acc: {chave: [delta, nova, zerada]} (todas as entradas com atividade); texts/meta só dos candidatos."""
+        users, dbs = names.get("users", {}), names.get("dbs", {})
+        cand = []
+        for k, (d, new, reset) in acc.items():
+            if not (d.get("calls") or 0) > 0:
+                continue
+            m = meta.get(k) or {}
+            text = texts.get(k)
+            if text is not None and m.get("userid") == own_user and _PROF_OWN.match(text):
+                continue                                  # consultas do próprio profiler
+            self.totals["sql_distintos"] += 1
+            self.totals["execucoes"] = (self.totals["execucoes"] or 0) + d["calls"]
+            self.totals["total_ms"] = (self.totals["total_ms"] or 0) + (d.get("total_ms") or 0)
+            if k not in meta:
+                continue
+            s = {"queryid": m.get("queryid"), "userid": m.get("userid"), "usuario": users.get(m.get("userid")),
+                 "dbid": m.get("dbid"), "banco": dbs.get(m.get("dbid")), "query": None, "new_in_period": new,
+                 "reliable": not reset}
+            if m.get("toplevel") is not None:
+                s["toplevel"] = m["toplevel"]
+            for c, v in d.items():
+                if v is not None:
+                    s[c] = round(v, 3) if isinstance(v, float) else v
+            s["mean_ms"] = round((d.get("total_ms") or 0) / d["calls"], 3)
+            for g in ("min_ms", "max_ms"):
+                if m.get(g) is not None:
+                    s[g + "_entrada"] = m[g]              # desde a criação da entrada, não só do período
+            s["io_blocks"] = sum(d.get(c) or 0 for c in ("shared_read", "local_read", "temp_read", "temp_written"))
+            if text is None:
+                s["query"] = None
+                self.lims.add("texto indisponível para alguns SQLs (entrada despejada do pg_stat_statements antes do fim "
+                              "ou sem permissão)")
+            else:
+                s["query"] = prof_cut(text, PROF_QUERY_MAX, "SQLs", self.lims)
+                norm = prof_norm(text)
+                s["group"] = norm[:60]
+                hit = seen.get(prof_key(text))
+                if hit:
+                    s["activity"] = {"vezes_visto": hit["n"], "max_s": round(hit["max_s"], 1), "esperando_lock": hit.get("lock_n", 0)}
+                refs = []
+                for tok in set(_PROF_IDENT.findall(norm)):
+                    for relid in tindex.get(tok, ())[:3]:
+                        if relid not in refs:
+                            refs.append(relid)
+                s["_rels"] = refs[:20]                    # relids; viram "schema.tabela" em consolidate
+                s["plan_seq_scan"] = plan_keys.get(prof_key(text))
+            s["_k"] = k
+            cand.append(s)
+        tot = self.totals["total_ms"] or 0
+        for s in cand:
+            s["pct_total"] = round(100.0 * (s.get("total_ms") or 0) / tot, 2) if tot else 0.0
+        return cand
+
+    def finish_statements(self, cand, tdelta):
+        """Rankings (100 de cada), potencial e a lista final (até 500, por tempo total)."""
+        def top(key, cond=lambda s: True):
+            return [s["_k"] for s in sorted((s for s in cand if cond(s)), key=lambda s: -(s.get(key) or 0))[:PROF_TOP]
+                    if (s.get(key) or 0) > 0]
+
+        for s in cand:
+            score, crit = self.potential(s, tdelta)
+            if score >= 10:
+                s["potencial"] = {"score": score, "criterios": crit}
+        rk = {"total": top("total_ms"), "mean": top("mean_ms"), "calls": top("calls"), "io": top("io_blocks"),
+              "potential": [s["_k"] for s in sorted((s for s in cand if "potencial" in s),
+                                                    key=lambda s: -s["potencial"]["score"])[:PROF_TOP]]}
+        keep = set()
+        for lst in rk.values():
+            keep.update(lst)
+        chosen = sorted((s for s in cand if s["_k"] in keep), key=lambda s: -(s.get("total_ms") or 0))
+        if len(chosen) > PROF_MAX_STMTS:
+            self.lims.add("SQLs: %d candidatos nos rankings; mantidos os %d de maior tempo total" % (len(chosen), PROF_MAX_STMTS))
+            chosen = chosen[:PROF_MAX_STMTS]
+        ids = {}
+        for i, s in enumerate(chosen, 1):
+            ids[s["_k"]] = s["id"] = "S%d" % i
+        self.rankings = {r: [ids[k] for k in lst if k in ids] for r, lst in rk.items()}
+        self.by_key = {s["id"]: s for s in chosen}
+        groups = {}
+        for s in cand:
+            if s.get("group"):
+                g = groups.setdefault(s["group"], {"prefixo": s["group"], "queryids": 0, "calls": 0, "total_ms": 0.0, "sqls": []})
+                g["queryids"] += 1
+                g["calls"] += s.get("calls") or 0
+                g["total_ms"] += s.get("total_ms") or 0
+                if s["_k"] in ids:
+                    g["sqls"].append(ids[s["_k"]])
+        self.groups = sorted((dict(g, total_ms=round(g["total_ms"], 1)) for g in groups.values() if g["queryids"] >= 2),
+                             key=lambda g: -g["total_ms"])[:50]
+        for s in chosen:
+            s.pop("_k", None)
+        self.stmts = chosen
+
+    def potential(self, s, tdelta):
+        """Pontuação heurística (NÃO é medição) com os critérios que a justificam."""
+        score, crit = 0, []
+        pct = s.get("pct_total") or 0
+        if pct >= 1:
+            score += int(round(min(100, pct)))
+            crit.append("%.1f%% do tempo total de SQL do período" % pct)
+        calls, mean = s.get("calls") or 0, s.get("mean_ms") or 0
+        if calls >= 10000 and mean < 5:
+            score += 15
+            crit.append("chamado %d vezes com média de %.2f ms: possível repetição por linha / N+1" % (calls, mean))
+        if (s.get("temp_written") or 0) > 0:
+            score += 15
+            crit.append("gravou %d blocos temporários (%.1f MB): ordenação/hash maior que work_mem"
+                        % (s["temp_written"], s["temp_written"] * self.block / 1048576.0))
+        hit, rd = s.get("shared_hit") or 0, s.get("shared_read") or 0
+        if rd >= 1000 and rd / float(hit + rd) >= 0.2:
+            score += 10
+            crit.append("%.0f%% dos blocos vieram de fora do shared_buffers (%d lidos)" % (100.0 * rd / (hit + rd), rd))
+        if mean >= 1000:
+            score += 10
+            crit.append("média de %.0f ms por execução" % mean)
+        if (s.get("activity") or {}).get("esperando_lock"):
+            score += 10
+            crit.append("visto esperando lock %d vez(es) na amostragem" % s["activity"]["esperando_lock"])
+        seq = [r for r in s.get("_rels") or () if ((tdelta.get(r) or [{}])[0].get("seq_tup_read") or 0) >= 1000000]
+        if seq:
+            score += 10
+            crit.append("envolve tabela(s) com muita leitura sequencial no período (%d)" % len(seq))
+        if s.get("plan_seq_scan"):
+            score += 5
+            crit.append("plano capturado com Seq Scan")
+        return score, crit
+
+    # ---- tabelas e funções ----
+    def set_tables(self, rels, last, tdelta, struct, idx_last, idx_delta, refs):
+        cols = {c: i for i, c in enumerate(last.get("cols") or PROF_TAB_COLS)}
+        icols = {c: i for i, c in enumerate(idx_last.get("cols") or PROF_IDX_COLS)}
+        by_rel = {}
+        for iid, r in (idx_last.get("rows") or {}).items():
+            by_rel.setdefault(r[icols["relid"]], {})[iid] = r
+        out = []
+        for relid in rels:
+            r = (last.get("rows") or {}).get(relid)
+            if r is None:
+                continue
+            g = lambda c: prof_num(r[cols[c]]) if c in cols else None
+            t = {"relid": relid, "schema": r[cols["schema"]], "name": r[cols["name"]], "relpages": g("relpages"),
+                 "size_bytes": (g("relpages") or 0) * self.block, "reltuples": g("reltuples"),
+                 "n_live_tup": g("n_live_tup"), "n_dead_tup": g("n_dead_tup"), "n_mod_since_analyze": g("n_mod_since_analyze")}
+            for c in ("last_vacuum", "last_autovacuum", "last_analyze", "last_autoanalyze"):
+                t[c] = r[cols[c]] if c in cols else None
+            d = tdelta.get(relid)
+            if d:
+                t["delta"] = {c: v for c, v in d[0].items() if v}
+                if d[2]:
+                    t["delta_reset"] = True
+            st = struct.get(relid) or {}
+            for c in ("columns", "constraints", "triggers", "reloptions", "stats"):
+                if st.get(c):
+                    t[c] = st[c]
+            idxs = []
+            for iid, ir in sorted((by_rel.get(relid) or {}).items()):
+                meta = (st.get("indexes") or {}).get(iid) or {}
+                ix = {"name": ir[icols["name"]], "relpages": prof_num(ir[icols["relpages"]]),
+                      "size_bytes": (prof_num(ir[icols["relpages"]]) or 0) * self.block}
+                ix.update({k: v for k, v in meta.items() if k != "keys"})
+                dd = idx_delta.get(iid)
+                if dd:
+                    ix["delta"] = {c: v for c, v in dd[0].items() if v is not None}
+                ix["_keys"] = meta.get("keys")
+                idxs.append(ix)
+            for a in idxs:                                # sobreposição: colunas de um são prefixo das de outro
+                for b in idxs:
+                    if a is b or not a["_keys"] or not b["_keys"] or a.get("partial") or b.get("partial"):
+                        continue
+                    if a.get("am") == b.get("am") and len(a["_keys"]) < len(b["_keys"]) and b["_keys"][:len(a["_keys"])] == a["_keys"]:
+                        a.setdefault("sobreposicao", []).append("colunas são prefixo de %s" % b["name"])
+                    elif a["name"] < b["name"] and a["_keys"] == b["_keys"] and a.get("am") == b.get("am") \
+                            and not (a.get("unique") or b.get("unique")):
+                        a.setdefault("sobreposicao", []).append("mesmas colunas de %s" % b["name"])
+            for ix in idxs:
+                ix.pop("_keys", None)
+            if idxs:
+                t["indexes"] = idxs
+            if refs.get(relid):
+                t["sqls"] = refs[relid]
+            out.append(t)
+        self.tables = out
+
+    def set_functions(self, fns, fdelta, defs, refs, trig):
+        out, total = [], 0
+        for oid, m in fns:
+            f = dict(m, oid=oid)
+            d = fdelta.get(oid)
+            if d:
+                f.update({c: (round(v, 3) if isinstance(v, float) else v) for c, v in d[0].items() if v is not None})
+            if refs.get(oid):
+                f["sqls"] = refs[oid]
+            if trig.get(oid):
+                f["triggers"] = trig[oid]
+            text = defs.get(oid)
+            if text is not None:
+                text = prof_cut(text, PROF_FUNC_DEF_MAX, "definições de função", self.lims)
+                if total + len(text) > PROF_FUNC_TOTAL:
+                    self.lims.add("definições de função: teto de %d MB atingido; as demais vão só com a assinatura"
+                                  % (PROF_FUNC_TOTAL >> 20))
+                else:
+                    total += len(text)
+                    f["definition"] = text
+            out.append(f)
+        self.functions = out
+
+    # ---- alertas e resumo ----
+    def build_alerts(self, cfg):
+        al = []
+
+        def add(nivel, titulo, evid):
+            al.append({"nivel": nivel, "titulo": titulo, "evidencia": evid})
+
+        pgss = cfg.get("pgss")
+        if pgss != "ok":
+            add("info", "Sem pg_stat_statements: só amostragem", "pg_stat_statements = %s; consultas rápidas não aparecem e "
+                "não há contagem de execuções" % pgss)
+        elif cfg.get("pgss_track") == "top":
+            add("info", "pg_stat_statements.track = top", "comandos dentro de funções PL/pgSQL e triggers não aparecem "
+                "separados (só a chamada de nível superior)")
+        st = self.stmts
+        if st and (st[0].get("pct_total") or 0) >= 30:
+            add("alto", "Um SQL concentra %.0f%% do tempo de SQL" % st[0]["pct_total"],
+                "%s: %d execuções, %.0f ms no total" % (st[0]["id"], st[0].get("calls") or 0, st[0].get("total_ms") or 0))
+        for s in st:
+            if (s.get("calls") or 0) >= 100000:
+                add("medio", "SQL executado %d vezes" % s["calls"], "%s, média %.2f ms: possível repetição por linha "
+                    "(N+1, trigger, laço)" % (s["id"], s.get("mean_ms") or 0))
+        db = self.database.get("delta") or {}
+        tb = db.get("temp_bytes") or 0
+        if tb >= 1 << 30:
+            add("medio", "Arquivos temporários: %.1f GB no período" % (tb / 1073741824.0),
+                "pg_stat_database.temp_bytes (%d arquivos); ver SQLs com temp_written" % (db.get("temp_files") or 0))
+        hit, rd = db.get("blks_hit") or 0, db.get("blks_read") or 0
+        if rd >= 100000 and hit + rd and hit / float(hit + rd) < 0.95:
+            add("medio", "Cache hit do banco em %.1f%%" % (100.0 * hit / (hit + rd)),
+                "%d blocos lidos fora do shared_buffers (podem ter vindo do cache do SO)" % rd)
+        if (db.get("deadlocks") or 0) > 0:
+            add("alto", "%d deadlock(s) no período" % db["deadlocks"], "pg_stat_database.deadlocks")
+        bg = self.database.get("bgwriter") or {}
+        req = bg.get("checkpoints_req", bg.get("num_requested")) or 0
+        tim = bg.get("checkpoints_timed", bg.get("num_timed")) or 0
+        if req >= 3 and req > tim:
+            add("medio", "Checkpoints por volume de WAL (%d) acima dos por tempo (%d)" % (req, tim),
+                "max_wal_size/checkpoint_segments possivelmente pequeno para a carga de escrita")
+        act = self.activity
+        if act.get("blocking"):
+            b = max(act["blocking"], key=lambda x: x.get("max_s") or 0)
+            add("medio", "Esperas por lock observadas (%d padrões)" % len(act["blocking"]),
+                "maior espera vista: %.0f s" % (b.get("max_s") or 0))
+        lx = [x for x in act.get("long_xacts") or () if (x.get("xact_s") or 0) >= 1800]
+        if lx:
+            add("medio", "Transações abertas há mais de 30 min (%d)" % len(lx), "maior: %.0f min (%s)"
+                % (lx[0]["xact_s"] / 60.0, lx[0].get("state")))
+        mc, pk = prof_num(act.get("max_connections")), act.get("peak_connections") or 0
+        if mc and pk >= 0.8 * mc:
+            add("medio", "Conexões chegaram a %d de %d" % (pk, mc), "pico na amostragem do pg_stat_activity")
+        for t in self.tables:
+            d = t.get("delta") or {}
+            if (d.get("seq_tup_read") or 0) >= 100000000:
+                add("alto", "Leitura sequencial: %s.%s" % (t["schema"], t["name"]), "%d linhas lidas em %d varreduras "
+                    "completas no período" % (d["seq_tup_read"], d.get("seq_scan") or 0))
+            elif (d.get("seq_scan") or 0) >= 100000 and (t.get("relpages") or 0) < 1000:
+                add("medio", "Tabela pequena varrida %d vezes: %s.%s" % (d["seq_scan"], t["schema"], t["name"]),
+                    "padrão de consulta por linha (trigger/laço) ou índice faltando")
+            live, dead = t.get("n_live_tup") or 0, t.get("n_dead_tup") or 0
+            if dead >= 10000 and dead / float(live + dead) >= 0.2:
+                add("medio", "Tuplas mortas: %s.%s (%.0f%%)" % (t["schema"], t["name"], 100.0 * dead / (live + dead)),
+                    "%d mortas; último autovacuum %s" % (dead, t.get("last_autovacuum") or "nunca"))
+        res = (self.resources or {}).get("fields") or {}
+        if (res.get("cpu_p95") or {}).get("avg", 0) >= 85:
+            add("medio", "CPU do servidor alta (p95 médio %.0f%%)" % res["cpu_p95"]["avg"], "correlação com o período, "
+                "não prova de causa")
+        if (res.get("mem_max") or {}).get("max", 0) >= 90 and max((res.get("swin") or {}).get("max", 0),
+                                                                  (res.get("swout") or {}).get("max", 0)) >= 10:
+            add("alto", "Memória do servidor no limite com uso de swap", "mem_max %.0f%%, swap ativo" % res["mem_max"]["max"])
+        if (res.get("psi_io") or {}).get("avg", 0) >= 20:
+            add("medio", "Pressão de I/O no servidor (psi_io médio %.0f%%)" % res["psi_io"]["avg"],
+                "correlação com o período; ver discos e SQLs com mais leitura")
+        self.alerts = sorted(al, key=lambda a: {"alto": 0, "medio": 1, "info": 2}[a["nivel"]])
+
+    def summary(self, cfg):
+        st = self.stmts
+        mean_rank = [self.by_key[i] for i in self.rankings.get("mean", [])[:5]]
+        cov = []
+        if cfg.get("pgss") == "ok":
+            cov.append("pg_stat_statements (track=%s): todas as execuções%s" % (
+                cfg.get("pgss_track") or "?", ", inclusive dentro de funções" if cfg.get("pgss_track") == "all" else
+                "; comandos dentro de funções não aparecem separados"))
+        else:
+            cov.append("sem pg_stat_statements: só a amostragem do pg_stat_activity (consultas rápidas não aparecem)")
+        cov.append("%d amostras do pg_stat_activity a cada %s s" % (self.activity.get("samples") or 0,
+                                                                   self.activity.get("interval_s") or "?"))
+        hw = [a["titulo"] for a in self.alerts if "servidor" in a["titulo"].lower()]
+        return {"sql_distintos": self.totals["sql_distintos"] or len(self.activity.get("top_seen") or ()),
+                "execucoes": self.totals["execucoes"], "total_time_ms": round(self.totals["total_ms"], 1)
+                if self.totals["total_ms"] is not None else None,
+                "top_total": [{"id": s["id"], "total_ms": s.get("total_ms"), "pct": s.get("pct_total"),
+                               "query": (s.get("query") or "")[:200]} for s in st[:5]],
+                "top_slow": [{"id": s["id"], "mean_ms": s.get("mean_ms"), "calls": s.get("calls"),
+                              "query": (s.get("query") or "")[:200]} for s in mean_rank],
+                "tables": ["%s.%s" % (t["schema"], t["name"]) for t in sorted(
+                    self.tables, key=lambda t: -((t.get("delta") or {}).get("seq_tup_read") or 0))[:10]],
+                "alerts": self.alerts, "hardware": hw, "coverage": "; ".join(cov)}
+
+    def text_summary(self):
+        """Resumo curto para a lista do histórico (prof_sessions.summary)."""
+        lines = ["- " + a["titulo"] for a in self.alerts if a["nivel"] != "info"][:8]
+        for s in self.stmts[:3]:
+            lines.append("- %s: %.0f%% do tempo (%d execuções)" % (s["id"], s.get("pct_total") or 0, s.get("calls") or 0))
+        if not lines:
+            lines.append("- sem problemas destacados pelas heurísticas")
+        return clip("\n".join(lines), 2000)
+
+    # ---- saída ----
+    def to_dict(self, cfg):
+        return {"format": 1, "kind": "c2_db_profile", "ident": self.ident, "sources": self.sources,
+                "limitations": list(self.lims.items), "summary": self.summary(cfg), "statements": self.stmts,
+                "groups": self.groups, "rankings": self.rankings, "activity": self.activity, "tables": self.tables,
+                "functions": self.functions, "plans": self.plans, "slow_log": self.slow_log, "database": self.database,
+                "settings": self.settings, "remessas": self.remessas, "resources": self.resources, "hourly": self.hourly}
+
+
+def prof_markdown(rep, resumo=False):
+    """Relatório C2 Database Performance Profile em Markdown, autocontido para análise por IA. resumo=True: versão
+    PARCIAL (cabeçalho diz o que ficou de fora), até PROF_MD_RESUMO_MAX caracteres."""
+    idn, sm = rep["ident"], rep["summary"]
+    by = {s["id"]: s for s in rep["statements"]}
+    nsql = 15 if resumo else len(rep["statements"])
+    out = ["# C2 Database Performance Profile", ""]
+    if resumo:
+        out += ["> **VERSÃO RESUMIDA (PARCIAL).** Contém os 15 primeiros de cada ranking, até 20 tabelas sem as colunas, "
+                "funções sem a definição e no máximo 5 planos. O relatório completo (Markdown e JSON) está na central "
+                "(Exportar).", ""]
+    out += ["Gerado pelo agente C2 Server Monitor %s. Valores do pg_stat_statements e das estatísticas são DIFERENÇAS "
+            "entre fotos do início e do fim do período (nunca zerados pelo profiler). Itens de \"potencial\" e alertas são "
+            "heurísticos, não medições; correlação com recursos do servidor não é prova de causa."
+            % idn.get("agent_version", ""), "", "## Instruções para o Claude", "", PROF_INSTRUCOES, ""]
+    out += ["## 1. Identificação", "", prof_md_table(["Campo", "Valor"], [
+        ("Empresa", idn.get("company")), ("Servidor", idn.get("server")), ("Sistema operacional", idn.get("os")),
+        ("Virtualização", idn.get("virt")), ("PostgreSQL", idn.get("pg_version")), ("Banco", idn.get("dbname")),
+        ("Início", idn.get("started_at_iso")), ("Fim", idn.get("ended_at_iso")),
+        ("Duração efetiva", "%s min" % round((idn.get("duration_s") or 0) / 60.0, 1)),
+        ("Duração configurada", "%s min" % idn.get("duracao_min")), ("Perfil", idn.get("perfil")),
+        ("Status", "%s (%s)" % (idn.get("status"), idn.get("motivo") or "-")), ("Iniciado por", idn.get("by")),
+        ("Interrompido por", idn.get("stopped_by"))]), ""]
+    out += ["## 2. Coleta: fontes e limitações", "", prof_md_table(["Fonte", "Situação"], sorted(rep["sources"].items())), ""]
+    out += ["Limitações:", ""] + (["- " + x for x in rep["limitations"]] or ["- nenhuma registrada"]) + [""]
+    out += ["## 3. Resumo executivo", "", "- SQLs distintos com atividade: %s" % sm.get("sql_distintos"),
+            "- Execuções (pg_stat_statements): %s" % (sm.get("execucoes") if sm.get("execucoes") is not None else "indisponível"),
+            "- Tempo total de SQL: %s ms" % (sm.get("total_time_ms") if sm.get("total_time_ms") is not None else "indisponível"),
+            "- Cobertura: %s" % sm.get("coverage"), "- Tabelas com mais leitura sequencial: %s" % (", ".join(sm.get("tables") or []) or "-"), ""]
+    out += ["## 4. Alertas (heurísticos)", ""] + (["- **%s** — %s. Evidência: %s" % (a["nivel"].upper(), a["titulo"], a["evidencia"])
+                                                   for a in sm.get("alerts") or ()] or ["- nenhum"]) + [""]
+    out += ["## 5. Rankings", ""]
+    titles = (("total", "Maior tempo total acumulado"), ("mean", "Maior tempo médio"), ("calls", "Maior frequência"),
+              ("io", "Maior consumo de I/O (blocos lidos de fora do cache + temporários)"),
+              ("potential", "Potencial de melhoria (heurístico: ver critérios em cada SQL)"))
+    for r, t in titles:
+        ids = rep["rankings"].get(r) or []
+        ids = ids[:15] if resumo else ids
+        out += ["### " + t, ""]
+        if not ids:
+            out += ["(sem dados)", ""]
+            continue
+        rows = []
+        for i in ids:
+            s = by[i]
+            rows.append((i, s.get("calls"), s.get("total_ms"), s.get("pct_total"), s.get("mean_ms"), s.get("shared_read"),
+                         s.get("temp_written"), (s.get("potencial") or {}).get("score"), (s.get("query") or "(sem texto)")[:80]))
+        out += [prof_md_table(["SQL", "calls", "total ms", "% total", "média ms", "shared read", "temp written",
+                               "potencial", "início do texto"], rows), ""]
+    want = []
+    for r, _ in titles:
+        for i in (rep["rankings"].get(r) or [])[:nsql]:
+            if i not in want:
+                want.append(i)
+    out += ["## 6. SQLs (métricas do período e texto)", ""]
+    for i in want:
+        s = by[i]
+        out += ["### %s (queryid %s, usuário %s, banco %s%s)" % (i, s.get("queryid"), s.get("usuario") or s.get("userid"),
+                                                              s.get("banco") or s.get("dbid"),
+                                                              ", toplevel=%s" % s["toplevel"] if "toplevel" in s else ""), ""]
+        out += [prof_fence(s.get("query") or "(texto indisponível)"), ""]
+        mets = ["%s=%s" % (k, prof_md_cell(s[k])) for k in ("calls", "total_ms", "mean_ms", "rows", "shared_hit", "shared_read",
+                                                            "shared_dirtied", "shared_written", "local_read", "temp_read",
+                                                            "temp_written", "blk_read_ms", "blk_write_ms", "plan_ms",
+                                                            "wal_bytes", "min_ms_entrada", "max_ms_entrada", "pct_total")
+                if s.get(k) is not None]
+        out += ["- Métricas: " + ", ".join(mets)]
+        if s.get("new_in_period"):
+            out += ["- Entrada criada durante o período (sem foto inicial): valores desde a criação"]
+        if not s.get("reliable", True):
+            out += ["- **Diferença não confiável**: estatística zerada/despejada no meio do período"]
+        if s.get("activity"):
+            out += ["- Amostragem: visto ativo %(vezes_visto)s vez(es), maior duração vista %(max_s)s s, esperando lock "
+                    "%(esperando_lock)s" % s["activity"]]
+        if s.get("tables"):
+            out += ["- Tabelas citadas: " + ", ".join(s["tables"])]
+        if s.get("potencial"):
+            out += ["- Potencial (heurístico) %d: %s" % (s["potencial"]["score"], "; ".join(s["potencial"]["criterios"]))]
+        out += [""]
+    if rep["groups"]:
+        out += ["## 7. SQL dinâmico agrupado por prefixo", "", prof_md_table(
+            ["prefixo normalizado", "queryids", "calls", "total ms", "SQLs no relatório"],
+            [(g["prefixo"], g["queryids"], g["calls"], g["total_ms"], ", ".join(g["sqls"][:10])) for g in rep["groups"][:30]]), ""]
+    out += ["## 8. Tabelas envolvidas", ""]
+    for t in rep["tables"][:20] if resumo else rep["tables"]:
+        d = t.get("delta") or {}
+        out += ["### %s.%s" % (t["schema"], t["name"]), "",
+                "- Tamanho (relpages × bloco, sem lock): %.1f MB; reltuples %s; vivas %s; mortas %s; modificadas desde o "
+                "analyze %s" % ((t.get("size_bytes") or 0) / 1048576.0, t.get("reltuples"), t.get("n_live_tup"),
+                                t.get("n_dead_tup"), t.get("n_mod_since_analyze")),
+                "- Último vacuum %s / autovacuum %s / analyze %s / autoanalyze %s" % (
+                    t.get("last_vacuum") or "nunca", t.get("last_autovacuum") or "nunca", t.get("last_analyze") or "nunca",
+                    t.get("last_autoanalyze") or "nunca"),
+                "- No período: " + (", ".join("%s=%s" % (k, v) for k, v in sorted(d.items())) or "sem atividade registrada")
+                + (" (estatística zerada no meio)" if t.get("delta_reset") else "")]
+        if t.get("sqls"):
+            out += ["- SQLs do relatório que a citam: " + ", ".join(t["sqls"][:30])]
+        if t.get("reloptions"):
+            out += ["- reloptions: %s" % t["reloptions"]]
+        if t.get("columns") and not resumo:
+            out += ["", prof_md_table(["coluna", "tipo", "not null", "n_distinct", "null_frac", "correlation"],
+                                      [(c["name"], c["type"], c.get("notnull"), c.get("n_distinct"), c.get("null_frac"),
+                                        c.get("correlation")) for c in t["columns"]])]
+        if t.get("constraints"):
+            out += ["", "Constraints:", ""] + ["- `%s` (%s): %s" % (c["name"], c["type"], c["def"]) for c in t["constraints"]]
+        if t.get("indexes"):
+            out += ["", "Índices:", ""]
+            for ix in t["indexes"]:
+                dd = ix.get("delta") or {}
+                out += ["- `%s` — %s; %.1f MB; idx_scan no período %s%s%s" % (
+                    ix["name"], ix.get("def") or "?", (ix.get("size_bytes") or 0) / 1048576.0, dd.get("idx_scan", 0),
+                    "; INVÁLIDO" if ix.get("valid") is False else "",
+                    "; possível sobreposição: " + ", ".join(ix["sobreposicao"]) if ix.get("sobreposicao") else "")]
+        if t.get("triggers"):
+            out += ["", "Triggers:", ""] + ["- %s" % g["def"] for g in t["triggers"]]
+        out += [""]
+    out += ["## 9. Funções e procedimentos", ""]
+    for f in rep["functions"]:
+        out += ["### %s.%s(%s) — %s" % (f.get("schema"), f.get("name"), f.get("args") or "", f.get("lang")), "",
+                "- No período: calls %s, total %s ms, self %s ms%s%s" % (
+                    f.get("calls", "?"), f.get("total_ms", "?"), f.get("self_ms", "?"),
+                    "; chamada pelos SQLs " + ", ".join(f["sqls"][:20]) if f.get("sqls") else "",
+                    "; usada por triggers " + ", ".join(f["triggers"][:10]) if f.get("triggers") else "")]
+        if f.get("definition") and not resumo:
+            out += ["", prof_fence(f["definition"])]
+        out += [""]
+    if not rep["functions"]:
+        out += ["(nenhuma função identificada ou track_functions desligado)", ""]
+    out += ["## 10. Planos de execução (EXPLAIN sem ANALYZE)", ""]
+    for p in rep["plans"][:5] if resumo else rep["plans"]:
+        out += ["Capturado %s (consulta ativa havia %s s%s):" % (p.get("captured_at"), p.get("duration_s"),
+                                                               ", SQL %s" % p["key"] if p.get("key") else ""), "",
+                prof_fence(p.get("sql")), "", prof_fence(prof_cut(p.get("plan"), 5000, "planos", None) if resumo else p.get("plan"), "text"), ""]
+    if not rep["plans"]:
+        out += ["(nenhum plano coletado: só no perfil detalhado, de SELECTs vistos ativos por ≥ 1 s; nenhum EXPLAIN "
+                "ANALYZE é executado)", ""]
+    if rep["slow_log"]:
+        out += ["## 11. Log de SQL lento (configurado pelo administrador)", ""]
+        for e in rep["slow_log"][:20] if resumo else rep["slow_log"]:
+            out += [prof_fence(e["text"], "text"), ""]
+    act = rep["activity"] or {}
+    out += ["## 12. Concorrência (amostragem do pg_stat_activity)", "",
+            "- %s amostras a cada %s s; pico de conexões %s (max_connections %s)" % (
+                act.get("samples"), act.get("interval_s"), act.get("peak_connections"), act.get("max_connections")), ""]
+    if act.get("waits"):
+        out += [prof_md_table(["espera", "amostras"], [(w["evento"], w["n"]) for w in act["waits"][:30]]), ""]
+    if act.get("top_seen"):
+        out += ["Consultas mais vistas em execução:", "", prof_md_table(
+            ["vezes", "maior s", "esperando lock", "usuários", "texto"],
+            [(x["n"], x["max_s"], x.get("lock_n", 0), ", ".join(x.get("users") or []), x["q"][:200])
+             for x in act["top_seen"][:15 if resumo else 50]]), ""]
+    if act.get("blocking"):
+        out += ["Bloqueios observados:", "", prof_md_table(
+            ["vezes", "maior espera s", "evento", "bloqueada", "bloqueadora"],
+            [(b["n"], b.get("max_s"), b.get("evento"), (b.get("blocked") or "")[:200], (b.get("blocker") or "")[:200])
+             for b in act["blocking"][:30]]), ""]
+    if act.get("long_xacts"):
+        out += ["Transações longas:", "", prof_md_table(
+            ["pid", "usuário", "aplicação", "estado", "transação aberta (s)", "texto"],
+            [(x["pid"], x.get("user"), x.get("app"), x.get("state"), x.get("xact_s"), (x.get("q") or "")[:200])
+             for x in act["long_xacts"][:30]]), ""]
+    db = rep["database"] or {}
+    out += ["## 13. Banco (pg_stat_database, checkpoints, bgwriter)", ""]
+    for k in ("delta", "bgwriter"):
+        if db.get(k):
+            out += ["- %s: %s" % (k, ", ".join("%s=%s" % (a, prof_md_cell(b)) for a, b in sorted(db[k].items())))]
+    if db.get("cache_hit_ratio") is not None:
+        out += ["- cache hit ratio do período: %.4f (blocos do shared_buffers; leituras \"de disco\" podem vir do cache "
+                "do SO)" % db["cache_hit_ratio"]]
+    out += [""]
+    res = rep["resources"] or {}
+    out += ["## 14. Recursos do servidor no período (C2 Server Monitor)", ""]
+    if res.get("windows"):
+        out += [prof_md_table(["métrica", "média", "máximo"], [(k, v["avg"], v["max"]) for k, v in res["fields"].items()]), ""]
+        for d, m in (res.get("disks") or {}).items():
+            out += ["- disco %s: %s" % (d, ", ".join("%s avg=%s max=%s" % (k, v["avg"], v["max"]) for k, v in m.items()))]
+        if res.get("peaks_disk"):
+            out += ["- janelas de pico de disco: " + ", ".join("%s (util %s%%, psi_io %s%%)" % (p["ts"], p["util_max"], p["psi_io"])
+                                                              for p in res["peaks_disk"])]
+        if res.get("peaks_cpu"):
+            out += ["- janelas de pico de CPU: " + ", ".join("%s (%s%%)" % (p["ts"], p["cpu_max"]) for p in res["peaks_cpu"])]
+        if res.get("hourly"):
+            keys = sorted({k for h in res["hourly"] for k in h if k != "hora_utc"})
+            out += ["", prof_md_table(["hora (UTC)"] + keys, [[h["hora_utc"]] + [h.get(k) for k in keys] for h in res["hourly"]])]
+    else:
+        out += ["(sem linhas DATA do monitor no período)"]
+    if res.get("virt_note"):
+        out += ["", "- " + res["virt_note"]]
+    out += [""]
+    if rep["remessas"]:
+        out += ["## 15. Remessas C2 no período (admin.log_imp_txt / log_imp_txt_seg)", ""]
+        out += [prof_md_table(["cod", "empresa", "início", "fim", "duração s", "situação", "concluído"],
+                              [(r.get("cod"), r.get("cod_emprs"), r.get("data_ini"), r.get("data_fim"), r.get("dur_s"),
+                                r.get("sit"), r.get("concluido")) for r in rep["remessas"]]), ""]
+        segs = sorted((dict(s, remessa=r.get("cod")) for r in rep["remessas"] for s in r.get("segmentos") or ()),
+                      key=lambda s: -(s.get("dur_s") or 0))[:20 if resumo else 60]
+        if segs:
+            out += ["Etapas mais longas:", "", prof_md_table(
+                ["remessa", "cod_seg", "descrição", "início", "duração s", "pausa s", "concluído"],
+                [(s["remessa"], s.get("cod_seg"), s.get("descricao"), s.get("data_ini"), s.get("dur_s"), s.get("pausa_s"),
+                  s.get("concluido")) for s in segs]), ""]
+    if rep["hourly"] and not resumo:
+        out += ["## 16. Evolução por intervalo entre fotos", "", prof_md_table(
+            ["fim do intervalo (UTC)", "min", "calls", "total ms", "shared read", "temp written", "SQLs de maior tempo"],
+            [(h["fim"], h.get("min"), h.get("calls"), h.get("total_ms"), h.get("shared_read"), h.get("temp_written"),
+              ", ".join(h.get("top") or [])) for h in rep["hourly"]]), ""]
+    out += ["## 17. Parâmetros do PostgreSQL", "", prof_md_table(
+        ["parâmetro", "valor", "unidade", "origem"], [(s["name"], s["setting"], s.get("unit"), s.get("source"))
+                                                       for s in rep["settings"]]), ""]
+    text = "\n".join(out)
+    if resumo and len(text) > PROF_MD_RESUMO_MAX:
+        text = text[:PROF_MD_RESUMO_MAX] + "\n\n[… VERSÃO RESUMIDA cortada em %d caracteres; use o relatório completo]" % PROF_MD_RESUMO_MAX
+    return text
+
+
+PROF_PGLOG_DIR = "/var/log/postgresql"      # logs do PostgreSQL no Debian/Ubuntu (sem logging_collector)
+PROF_TEXT_COLS = {"schema", "name", "last_vacuum", "last_autovacuum", "last_analyze", "last_autoanalyze", "relid"}
+PROF_SV = {".sv": "timestamp"}
+
+
+class Profiler:
+    """Profile do banco (v2.16, docs/PROFILER_BANCO.md). Thread 'profiler': recebe os pedidos que a escuta do
+    DbAgent entrega (db_requests/{sid}/prof), responde em prof_ack, publica a prontidão (prof_state) e conduz a
+    sessão: fotos das estatísticas cumulativas (início, a cada duração/6 entre 5 min e 1 h, fim) e amostras do
+    pg_stat_activity, com prazo controlado aqui (a central pode estar fechada). No fim consolida o relatório
+    (ProfReport + Markdown), grava em SYNC_DIR/prof/<pid>.json.gz e envia em partes (prof_reports) até conseguir.
+
+    NUNCA altera o PostgreSQL: conexão própria (application_name c2_profiler) com default_transaction_read_only,
+    statement_timeout e lock_timeout; nada de funções de tamanho/count (pedem lock; relpages/reltuples bastam),
+    nenhum reset de estatística. Encerrar = fechar a conexão (a trava advisory do cluster vai junto).
+    Estado em SYNC_DIR/profiler.json (atômico): sessão ativa (retomada na partida; prazo vencido = encerrada com o
+    que está no disco), sessões encerradas ainda não enviadas e as respostas por rid (pedido reentregue não repete)."""
+
+    def __init__(self, cloud, db, out=None):
+        self.cloud, self.db, self.live, self.ident, self.out = cloud, db, cloud.live, cloud.ident, out
+        self.sid = self.ident.install_id
+        self.path = os.path.join(cloud.dir, PROF_FILE)
+        self.dir = os.path.join(cloud.dir, PROF_DIR)
+        self.audit_path = os.path.join(cloud.base, PROF_AUDIT_FILE)
+        self.stop_ev, self.wake_ev = threading.Event(), threading.Event()
+        self.thread, self.pg, self.locked, self.cur_timeout = None, None, False, None
+        self.mx = threading.Lock()
+        self.box, self.handled = {}, {}
+        self.st = self.load()
+        self.ready, self.ready_sent, self.ready_at, self.cap = None, None, 0.0, {}
+        self.act, self.s0 = None, None
+        self.next = {}
+        self.mono0 = None
+        self.resumed = False
+        self.up_fails, self.up_next = 0, 0.0
+        self.next_prune = time.time() + PROF_PRUNE_FIRST
+        db.prof = self
+
+    def say(self, s):
+        if self.out:
+            self.out(s)
+
+    # ---- estado local ----
+    def load(self):
+        d = read_json(self.path)
+        d = d if isinstance(d, dict) else {}
+        a = d.get("active")
+        a = a if isinstance(a, dict) and PROF_ID_RE.match(str(a.get("pid", ""))) and is_num(a.get("deadline_epoch")) else None
+        st = {"active": a, "pruned_at": d["pruned_at"] if is_num(d.get("pruned_at")) else 0}
+        for k in ("done", "acks"):
+            st[k] = {x: v for x, v in (d.get(k) or {}).items() if PROF_ID_RE.match(x) and isinstance(v, dict)} \
+                if isinstance(d.get(k), dict) else {}
+        return st
+
+    def save(self):
+        os.makedirs(self.cloud.dir, mode=0o700, exist_ok=True)
+        write_private(self.path, json.dumps(self.st, separators=(",", ":"), ensure_ascii=False))
+
+    def sdir(self, pid):
+        return os.path.join(self.dir, pid)
+
+    def report_path(self, pid):
+        return os.path.join(self.dir, pid + ".json.gz")
+
+    @staticmethod
+    def write_gz(path, obj):
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        data = obj if isinstance(obj, bytes) else gzip.compress(
+            json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8"), 6)
+        tmp = path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0), 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+        return len(data)
+
+    @staticmethod
+    def read_gz(path):
+        try:
+            with open(path, "rb") as f:
+                return json.loads(gzip.decompress(f.read()).decode("utf-8"))
+        except (OSError, ValueError, EOFError):
+            return None
+
+    def audit(self, event, **kw):
+        line = json.dumps(dict({"at": iso_now(), "evento": event}, **kw), ensure_ascii=False)
+        try:
+            fd = os.open(self.audit_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600)
+            try:
+                if hasattr(os, "fchmod"):
+                    os.fchmod(fd, 0o600)
+                os.write(fd, (line + "\n").encode("utf-8"))
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+
+    @staticmethod
+    def lim(a, text):
+        if text not in a["lims"]:
+            a["lims"].append(text)
+
+    # ---- ciclo de vida ----
+    def start(self):
+        self.thread = threading.Thread(target=self.loop, name="profiler", daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        """Parada do agente: a sessão continua no disco e é retomada (ou encerrada, se o prazo venceu) na partida."""
+        self.stop_ev.set()
+        self.wake_ev.set()
+        if self.thread is not None and self.thread is not threading.current_thread():
+            self.thread.join(10)
+        a = self.st["active"]
+        if a is not None and self.act is not None:
+            with contextlib.suppress(OSError):
+                self.save_act(a)
+                self.save()
+        self.close_pg()
+
+    def inbox(self, box):
+        """Chamado pela thread 'banco' com o filho db_requests/{sid}/prof inteiro (espelho da escuta)."""
+        with self.mx:
+            self.box = dict(box)
+        self.wake_ev.set()
+
+    def loop(self):
+        while not self.stop_ev.is_set():
+            try:
+                wait = self.step()
+            except Exception as e:                        # nunca derruba a thread
+                self.say("Profile do banco: erro interno (%s: %s)" % (type(e).__name__, e))
+                a = self.st["active"]
+                if a is not None:
+                    self.lim(a, "erro interno no agente (%s)" % type(e).__name__)
+                wait = 30
+            self.wake_ev.wait(max(0.2, min(wait, 30)))
+            self.wake_ev.clear()
+
+    def enabled(self):
+        cfg = self.ident.sync_cfg()
+        return cfg["db_profiler"] and cfg["db_access"]
+
+    def step(self):
+        now = time.time()
+        on = self.enabled()
+        self.take_requests(on)
+        wait = 30.0
+        a = self.st["active"]
+        if a is not None:
+            if not self.resumed:
+                self.resumed = True
+                self.resume(a)
+            a = self.st["active"]
+        if a is not None:
+            if not on:
+                self.finalize(a, "interrompido", "desligado", use_db=False)
+            elif self.db.cfg is None:
+                if self.expired(a):
+                    self.finalize(a, "concluido", "prazo", use_db=False)
+            else:
+                wait = self.tick(a)
+        self.resend_acks()
+        if any(not d.get("uploaded") for d in self.st["done"].values()) and time.time() >= self.up_next:
+            self.upload()
+        if self.st["active"] is None:
+            if not on:
+                self.publish_ready({"ok": False, "error_code": "desligado", "error": "profile do banco desligado neste "
+                                    "servidor (sync.%s)" % ("db_profiler" if not self.ident.sync_cfg()["db_profiler"]
+                                                            else "db_access")})
+            elif self.db.cfg is not None and now - self.ready_at >= PROF_READY_EVERY:
+                self.publish_ready(self.check_ready())
+                self.close_pg()
+        if time.time() >= self.next_prune:
+            self.prune()
+        return wait
+
+    # ---- pedidos ----
+    def take_requests(self, on):
+        with self.mx:
+            box = dict(self.box)
+        now = time.time()
+        for rid in sorted(box):
+            if self.stop_ev.is_set():
+                break
+            req = box[rid]
+            if not PROF_ID_RE.match(rid) or not isinstance(req, dict):
+                continue
+            if now - self.handled.get(rid, 0) < 60:
+                continue
+            self.handled[rid] = now
+            old = self.st["acks"].get(rid)
+            if old is not None:                           # já respondido (reentrega): só reenvia e remove o pedido
+                self.send_ack(rid, old["doc"], {})
+                continue
+            self.handle(rid, req, on)
+        self.handled = {r: t for r, t in self.handled.items() if now - t < 600}
+
+    def handle(self, rid, req, on):
+        acao = req.get("acao")
+        by = req["by"] if isinstance(req.get("by"), str) else "?"
+        at = req["at"] if is_num(req.get("at")) else 0
+        pid = req.get("pid") if isinstance(req.get("pid"), str) and PROF_ID_RE.match(req["pid"]) else None
+        extra = {}
+        try:
+            if self.stop_ev.is_set():
+                raise DbError("parando", "o agente está parando: tente de novo em ~1 min")
+            if acao == "iniciar":
+                extra = self.req_start(rid, req, pid, by, at, on)
+            elif acao == "interromper":
+                self.req_stop(pid, by)
+            elif acao == "verificar":
+                self.req_check(at, on)
+            else:
+                raise DbError("pedido_invalido", "ação desconhecida")
+            doc = {"state": "aceito", "ok": True}
+        except DbError as e:
+            doc = {"state": "recusado", "ok": False, "error_code": e.code if e.code in PROF_ERROR_CODES else "interno",
+                   "error": clip(str(e), 500)}
+        if acao in PROF_ACOES:
+            doc["acao"] = acao
+        if pid:
+            doc["pid"] = pid
+        self.audit("pedido", rid=rid, acao=acao, pid=pid, by=by, requested_at=at, state=doc["state"],
+                   error_code=doc.get("error_code"), duracao_min=req.get("duracao_min"), perfil=req.get("perfil"))
+        self.st["acks"][rid] = {"doc": doc, "t": time.time(), "sent": False}
+        self.save()
+        self.send_ack(rid, doc, extra)
+
+    def send_ack(self, rid, doc, extra):
+        patch = {"prof_ack/%s/%s" % (self.sid, rid): dict(doc, at=PROF_SV, agent_version=VERSION),
+                 "db_requests/%s/%s/%s" % (self.sid, PROF_INBOX, rid): None}
+        patch.update(extra)
+        try:
+            self.live.patch("", patch, timeout=30)
+        except CloudError:
+            return False
+        if rid in self.st["acks"]:
+            self.st["acks"][rid]["sent"] = True
+            self.save()
+        return True
+
+    def resend_acks(self):
+        now = time.time()
+        for rid, ak in list(self.st["acks"].items()):
+            if now - ak.get("t", 0) > PROF_ACK_KEEP:
+                del self.st["acks"][rid]
+            elif not ak.get("sent") and now - self.handled.get(rid, 0) >= 60:
+                self.handled[rid] = now
+                self.send_ack(rid, ak["doc"], {})
+
+    def req_start(self, rid, req, pid, by, at, on):
+        dur, perfil = req.get("duracao_min"), req.get("perfil")
+        if pid is None or isinstance(dur, bool) or dur not in PROF_DURATIONS or perfil not in PROF_PERFIS:
+            raise DbError("pedido_invalido", "pedido fora do contrato (pid, duracao_min ou perfil)")
+        a = self.st["active"]
+        if (a is not None and a["pid"] == pid) or pid in self.st["done"]:
+            return {}                                     # mesmo pid: já iniciado (idempotente)
+        age = self.live.server_now() * 1000 - at
+        if age > PROF_EXPIRE * 1000:
+            raise DbError("expirado", "pedido expirado (%d s na fila): profile não iniciado" % (age // 1000))
+        if not on or self.db.cfg is None:
+            raise DbError("desligado", "profile do banco desligado ou acesso ao banco não configurado neste servidor")
+        if a is not None:
+            raise DbError("sessao_ativa", "já há um profile ativo neste servidor (%s)" % a["pid"])
+        a = self.begin(pid, rid, by, int(dur), perfil)
+        return {"prof_sessions/%s/%s" % (self.sid, pid): self.session_doc(a)}
+
+    def req_stop(self, pid, by):
+        if pid is None:
+            raise DbError("pedido_invalido", "pedido sem pid")
+        a = self.st["active"]
+        if a is not None and a["pid"] == pid:
+            if not a.get("stop"):
+                a["stop"] = {"by": clip(by, 128)}
+                self.save()
+            self.wake_ev.set()
+            return
+        if pid not in self.st["done"]:
+            raise DbError("sessao_desconhecida", "este servidor não tem o profile %s" % pid)
+
+    def req_check(self, at, on):
+        age = self.live.server_now() * 1000 - at
+        if age > PROF_EXPIRE * 1000:
+            raise DbError("expirado", "pedido expirado (%d s na fila)" % (age // 1000))
+        if not on or self.db.cfg is None:
+            raise DbError("desligado", "profile do banco desligado ou acesso ao banco não configurado neste servidor")
+        if self.st["active"] is None:
+            self.publish_ready(self.check_ready())
+            self.close_pg()
+        else:
+            self.publish_ready(self.ready or {"ok": True}, force=True)
+
+    # ---- PostgreSQL ----
+    def open_pg(self, c):
+        return PgConn(c.get("host"), c.get("port"), c.get("dbname") or "", c.get("user") or "", c.get("password") or "",
+                      c.get("sslmode"), app=PROF_APP)
+
+    def conn(self):
+        if self.pg is None:
+            pg = self.open_pg(self.db.cfg or {})
+            try:
+                pg.sock.settimeout(PROF_SNAP_MS / 1000.0 + 20)
+                pg.simple("SET default_transaction_read_only = on; SET lock_timeout = %d; SET statement_timeout = %d"
+                          % (PROF_LOCK_MS, PROF_SNAP_MS))
+            except DbError:
+                pg.close()
+                raise
+            self.pg, self.cur_timeout, self.locked = pg, PROF_SNAP_MS, False
+            a = self.st["active"]
+            if a is not None and a.get("state") == "ativo" and not self.lock():
+                self.lim(a, "a trava de profile do cluster estava em uso na reconexão (outro profiler no mesmo "
+                            "PostgreSQL?): coleta seguiu")
+        return self.pg
+
+    def close_pg(self):
+        if self.pg is not None:
+            self.pg.close()                               # fecha a sessão: a trava advisory é solta junto
+            self.pg = None
+        self.locked = False
+
+    def rows(self, name, sql, values=(), timeout=PROF_SNAP_MS, max_bytes=64 << 20):
+        """Uma consulta do profiler (autocommit numa conexão READ ONLY; timeout por categoria). Devolve (colunas,
+        linhas em texto). Conexão quebrada = fechada (a próxima chamada reconecta)."""
+        pg = self.conn()
+        t0 = time.monotonic()
+        try:
+            if timeout != self.cur_timeout:
+                pg.simple("SET statement_timeout = %d" % timeout)
+                self.cur_timeout = timeout
+            cols, _, out, _, more = pg.query(PROF_TAG % name + sql, [None if v is None else str(v) for v in values], 0,
+                                             max_bytes)
+        except DbError as e:
+            if getattr(e, "broken", False):
+                self.close_pg()
+            raise
+        finally:
+            a = self.st["active"]
+            if a is not None:
+                a["overhead_ms"] = a.get("overhead_ms", 0) + (time.monotonic() - t0) * 1000
+        if more:
+            raise DbError("sql", "resposta grande demais (%s)" % name)
+        return cols, out
+
+    def lock(self):
+        _, r = self.rows("trava", "SELECT pg_try_advisory_lock($1::bigint)::text", [PROF_LOCK_KEY])
+        self.locked = bool(r) and prof_bool(r[0][0])
+        return self.locked
+
+    # ---- prontidão ----
+    def check_ready(self):
+        doc = {"ok": False}
+        try:
+            doc.update(self.probe())
+            doc["ok"] = True
+        except DbError as e:
+            self.close_pg()
+            doc.update(error_code=e.code if e.code in ("conexao", "autenticacao") else "interno", error=clip(str(e), 500))
+        self.ready_at = time.time()
+        self.ready = doc
+        return doc
+
+    def probe(self):
+        _, r = self.rows("versao", "SELECT current_setting('server_version'), current_setting('server_version_num'), "
+                                   "current_database(), (SELECT rolsuper::text FROM pg_roles WHERE rolname = current_user), "
+                                   "(SELECT oid::text FROM pg_roles WHERE rolname = current_user), "
+                                   "current_setting('block_size')")
+        ver, num, dbn, sup, uoid, block = r[0]
+        num, sup = prof_num(num) or 0, prof_bool(sup)
+        d = {"pg_version": clip(ver or "", 64), "pg_num": num, "dbname": clip(dbn or "", 63), "superuser": sup}
+        cap = {"pg_num": num, "own_user": uoid, "block": prof_num(block) or 8192, "pgss": False}
+        ras = sup
+        if num >= 100000 and not sup:
+            _, r = self.rows("papel", "SELECT (pg_has_role(current_user, 'pg_read_all_stats', 'MEMBER') OR "
+                                      "pg_has_role(current_user, 'pg_monitor', 'MEMBER'))::text")
+            ras = prof_bool(r[0][0])
+        d["read_all_stats"] = ras
+        _, r = self.rows("parametros", "SELECT name, setting, unit, source FROM pg_settings WHERE name = ANY($1::text[])",
+                         ["{" + ",".join(PROF_SETTINGS) + "}"])
+        sets = {x[0]: x for x in r}
+        cap["settings"] = [{"name": n, "setting": sets[n][1], "unit": sets[n][2], "source": sets[n][3]}
+                           for n in PROF_SETTINGS if n in sets]
+        sv = lambda n, dflt="": sets[n][1] if n in sets and sets[n][1] is not None else dflt
+        preload = sv("shared_preload_libraries")
+        loaded = "pg_stat_statements.max" in sets or "pg_stat_statements" in preload
+        _, r = self.rows("extensao", "SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace "
+                                     "WHERE e.extname = 'pg_stat_statements'")
+        pgss, pgss_err = "sem_preload", ""
+        if loaded and not r:
+            pgss = "sem_extensao"
+        elif r:
+            nsp = '"%s"' % r[0][0].replace('"', '""')
+            try:
+                cols, _ = self.rows("pgss_colunas", "SELECT * FROM %s.pg_stat_statements(false) LIMIT 0" % nsp)
+                phys = {}
+                for logical, names in PROF_PGSS + PROF_PGSS_GAUGE:
+                    for n in names:
+                        if n in cols:
+                            phys[logical] = n
+                            break
+                cap.update(pgss=True, nsp=nsp, pgss_cols=[[k, v] for k, v in phys.items()], toplevel="toplevel" in cols,
+                           pgss_info=False)
+                if num >= 140000:
+                    with contextlib.suppress(DbError):
+                        self.rows("pgss_info", "SELECT dealloc FROM %s.pg_stat_statements_info" % nsp)
+                        cap["pgss_info"] = True
+                pgss = "ok"
+            except DbError as e:
+                if getattr(e, "broken", False):
+                    raise
+                st = getattr(e, "sqlstate", None)
+                pgss = "sem_permissao" if st == "42501" else "sem_preload" if st == "55000" else "erro"
+                pgss_err = str(e)
+        d["pgss"] = pgss
+        if "pg_stat_statements.track" in sets:
+            d["pgss_track"] = sv("pg_stat_statements.track")
+        if prof_num(sv("pg_stat_statements.max")) is not None:
+            d["pgss_max"] = prof_num(sv("pg_stat_statements.max"))
+        d["track_io_timing"] = sv("track_io_timing") == "on"
+        d["track_functions"] = sv("track_functions", "none")
+        d["track_activity_query_size"] = prof_num(sv("track_activity_query_size")) or 1024
+        d["auto_explain"] = "auto_explain" in preload or "auto_explain" in sv("session_preload_libraries")
+        lmd = prof_num(sv("log_min_duration_statement"))
+        d["log_min_duration"] = lmd if lmd is not None else -1
+        _, r = self.rows("remessa", "SELECT c.relname, has_table_privilege(c.oid, 'SELECT')::text FROM pg_class c "
+                                    "JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'admin' "
+                                    "AND c.relname IN ('log_imp_txt', 'log_imp_txt_seg')")
+        d["c2_remessa"] = len([x for x in r if prof_bool(x[1])]) == 2
+        files = self.log_candidates(sets, num)
+        d["log_readable"] = bool(files)
+        cap.update(tq=d["track_activity_query_size"], remessa=d["c2_remessa"], log_files=files,
+                   max_connections=sv("max_connections"), pgss_state=pgss, pgss_track=d.get("pgss_track"))
+        d["notes"] = self.notes(d, pgss_err)
+        self.cap = cap
+        return d
+
+    def log_candidates(self, sets, num):
+        """Arquivos de log do PostgreSQL legíveis pelo agente (só com o banco nesta máquina)."""
+        host = str((self.db.cfg or {}).get("host") or "")
+        if not (host in ("", "127.0.0.1", "localhost", "::1") or host.startswith("/")):
+            return []
+        g = lambda n: sets[n][1] if n in sets and sets[n][1] else ""
+        if g("logging_collector") == "on" and g("log_directory"):
+            base = g("log_directory")
+            if not os.path.isabs(base):
+                if not g("data_directory"):
+                    return []
+                base = os.path.join(g("data_directory"), base)
+            files = glob.glob(os.path.join(base, "*"))
+        else:
+            major = "9.6" if 0 < num < 100000 and num // 100 == 906 else (
+                "%d.%d" % (num // 10000, num // 100 % 100) if num < 100000 else str(num // 10000))
+            files = glob.glob(os.path.join(PROF_PGLOG_DIR, "postgresql-%s-*.log" % major))
+        files = [f for f in files if os.path.isfile(f) and os.access(f, os.R_OK)]
+        return sorted(files, key=lambda f: os.path.getmtime(f))[-5:]
+
+    @staticmethod
+    def notes(d, pgss_err):
+        db, n = d.get("dbname") or "?", []
+        if d["pgss"] == "sem_preload":
+            n.append("pg_stat_statements não está habilitado. Para métricas completas de execução SQL é necessária uma "
+                     "preparação administrativa do PostgreSQL: shared_preload_libraries = 'pg_stat_statements' (exige "
+                     "reinício programado) e depois CREATE EXTENSION pg_stat_statements no banco %s." % db)
+        elif d["pgss"] == "sem_extensao":
+            n.append("pg_stat_statements está carregado, mas falta CREATE EXTENSION pg_stat_statements no banco %s "
+                     "(sem reinício)." % db)
+        elif d["pgss"] == "sem_permissao":
+            n.append("O usuário do monitor não pode ler pg_stat_statements: conceda pg_read_all_stats (PostgreSQL 10+) "
+                     "ou use um superusuário.")
+        elif d["pgss"] == "erro":
+            n.append("Falha ao ler pg_stat_statements: %s" % pgss_err)
+        if d["pgss"] == "ok" and not d.get("read_all_stats"):
+            n.append("Sem superusuário/pg_read_all_stats: textos e queryid de consultas de outros usuários ficam ocultos.")
+        if d.get("pgss_track") == "top":
+            n.append("pg_stat_statements.track = top: comandos dentro de funções PL/pgSQL e triggers não aparecem; "
+                     "recomendado 'all' (só reload, sem reinício).")
+        if d.get("track_functions") == "none":
+            n.append("track_functions = none: sem tempo por função; recomendado 'pl' (só reload).")
+        if not d.get("track_io_timing"):
+            n.append("track_io_timing = off: sem separação entre tempo de disco e de CPU; recomendado on depois de "
+                     "medir o custo com pg_test_timing (só reload).")
+        if d.get("log_min_duration", -1) < 0 and not d.get("auto_explain"):
+            n.append("SQL lento no log desligado (log_min_duration_statement = -1): o perfil detalhado só lê o log se o "
+                     "administrador ligar (ex.: 1000 ms). O profiler nunca altera essa configuração.")
+        elif not d.get("log_readable"):
+            n.append("O log do PostgreSQL não está acessível ao agente: o perfil detalhado não lê SQL lento do log.")
+        if not d.get("c2_remessa"):
+            n.append("admin.log_imp_txt/log_imp_txt_seg não encontradas ou sem permissão: sem tempos de remessa.")
+        return clip("\n".join(n), 4000)
+
+    def publish_ready(self, doc, force=False):
+        doc = dict(doc)
+        a = self.st["active"]
+        if a is not None:
+            doc["active"] = a["pid"]
+        doc["agent_version"] = VERSION
+        if doc == self.ready_sent and not force:
+            return
+        try:
+            self.live.patch("", {"prof_state/" + self.sid: dict(doc, checked_at=PROF_SV)}, timeout=30)
+            self.ready_sent = doc
+        except CloudError:
+            pass
+
+    # ---- sessão ----
+    def begin(self, pid, rid, by, dur, perfil):
+        self.close_pg()
+        try:
+            ready = self.check_ready()
+            if not ready["ok"]:
+                raise DbError(ready.get("error_code") or "conexao", ready.get("error") or "sem conexão com o PostgreSQL")
+            if not self.lock():
+                raise DbError("conflito_cluster", "outro profile está ativo neste PostgreSQL (trava do C2 profiler em uso)")
+            now, ms = time.time(), int(self.live.server_now() * 1000)
+            a = {"pid": pid, "rid": rid, "by": clip(by, 128), "perfil": perfil, "duracao_min": dur, "started_ms": ms,
+                 "deadline_ms": ms + dur * 60000, "started_epoch": now, "deadline_epoch": now + dur * 60, "state": "ativo",
+                 "snaps": [], "lims": [], "samples": 0, "overhead_ms": 0.0, "interval": PROF_SAMPLE[perfil], "stop": None,
+                 "pg_version": ready.get("pg_version"), "dbname": ready.get("dbname"), "cap": self.cap, "log_offsets": {},
+                 "overhead_alerta": False, "last_sample": None, "progress": {}, "db_errors": 0}
+            self.act = self.new_act()
+            self.mono0 = (time.monotonic(), now)
+            self.st["active"] = a
+            self.resumed = True
+            self.snapshot(a)
+            if perfil == "detalhado" and ready.get("log_readable") and (ready.get("log_min_duration", -1) >= 0
+                                                                        or ready.get("auto_explain")):
+                for f in self.cap.get("log_files") or ():
+                    with contextlib.suppress(OSError):
+                        a["log_offsets"][f] = os.path.getsize(f)
+            self.save_act(a)
+            self.save()
+        except DbError:
+            self.st["active"], self.act = None, None
+            shutil.rmtree(self.sdir(pid), ignore_errors=True)
+            self.close_pg()
+            raise
+        self.schedule(a, now)
+        self.audit("inicio", pid=pid, by=by, perfil=perfil, duracao_min=dur)
+        self.say("Profile do banco: sessão %s iniciada (%s, %d min)." % (pid, perfil, dur))
+        self.publish_ready(ready, force=True)
+        return a
+
+    @staticmethod
+    def new_act():
+        return {"seen": {}, "outros": 0, "waits": {}, "long": {}, "blocking": {}, "series": {}, "peak": 0, "noperm": 0,
+                "plans": [], "plans_done": [], "explain_fail": 0}
+
+    @staticmethod
+    def snap_every(a):
+        return min(PROF_SNAP_MAX, max(PROF_SNAP_MIN, a["duracao_min"] * 10))
+
+    def schedule(self, a, now):
+        self.next = {"sample": now, "snap": now + self.snap_every(a), "progress": now, "save": now + PROF_SAVE_S}
+
+    def resume(self, a):
+        """Partida com sessão no estado local: prazo vencido = encerra com o que está no disco (fim = última foto);
+        senão retoma a coleta (lacuna registrada)."""
+        if a.get("state") == "finalizando":
+            f = a.get("final") or {}
+            return self.finalize(a, f.get("state", "concluido"), f.get("motivo", "recuperacao"), final_snap=False)
+        self.act = self.read_gz(os.path.join(self.sdir(a["pid"]), "activity.json.gz")) or self.new_act()
+        if self.expired(a):
+            stop = a.get("stop")
+            return self.finalize(a, "interrompido" if stop else "concluido", "usuario" if stop else "recuperacao",
+                                 final_snap=False)
+        now = time.time()
+        self.lim(a, "agente reiniciado durante a sessão: lacuna na amostragem de %s até %s" % (
+            utc_iso(a.get("last_sample") or a["started_epoch"]), utc_iso(now)))
+        self.mono0 = (time.monotonic(), now)
+        self.schedule(a, now)
+        self.next["snap"] = now + 60
+        self.say("Profile do banco: sessão %s retomada depois do reinício." % a["pid"])
+        self.audit("retomada", pid=a["pid"])
+
+    def expired(self, a):
+        now = time.time()
+        if now >= a["deadline_epoch"] or self.live.server_now() * 1000 >= a["deadline_ms"]:
+            return True
+        return self.mono0 is not None and time.monotonic() - self.mono0[0] >= a["deadline_epoch"] - self.mono0[1]
+
+    def tick(self, a):
+        now = time.time()
+        if self.mono0 is not None and not a.get("clock_flag"):
+            drift = (now - self.mono0[1]) - (time.monotonic() - self.mono0[0])
+            if abs(drift) > PROF_CLOCK_JUMP:
+                a["clock_flag"] = True
+                self.lim(a, "relógio do servidor ajustado em %+d s durante a sessão (prazo controlado também pelo "
+                            "relógio monotônico)" % drift)
+        if a.get("stop"):
+            self.finalize(a, "interrompido", "usuario")
+            return 1.0
+        if self.expired(a):
+            self.finalize(a, "concluido", "prazo")
+            return 1.0
+        try:
+            if now >= self.next["sample"]:
+                last = a.get("last_sample")
+                if last and now - last > max(120, 4 * a["interval"]):
+                    self.lim(a, "lacuna na amostragem de %s até %s" % (utc_iso(last), utc_iso(now)))
+                self.sample(a)
+            if now >= self.next["snap"]:
+                self.snapshot(a)
+                self.next["snap"] = time.time() + self.snap_every(a)
+        except DbError as e:
+            self.close_pg()
+            a["db_errors"] = a.get("db_errors", 0) + 1
+            if a["db_errors"] <= 3:
+                self.lim(a, "falha no PostgreSQL durante a coleta às %s: %s" % (utc_iso(now), e))
+            self.next["sample"] = now + max(30, a["interval"])
+        if now >= self.next["progress"]:
+            self.publish_session(a)
+            self.next["progress"] = now + PROF_PROGRESS_S
+        if now >= self.next["save"]:
+            self.save_act(a)
+            self.save()
+            self.next["save"] = now + PROF_SAVE_S
+        return max(0.2, min(self.next.values()) - time.time())
+
+    # ---- amostragem do pg_stat_activity ----
+    def sample(self, a):
+        t0 = time.monotonic()
+        cap = a["cap"]
+        _, r = self.rows("atividade", PROF_ACT_SQL % (", backend_type" if cap.get("pg_num", 0) >= 100000 else ""),
+                         timeout=PROF_SAMPLE_MS)
+        dt = time.monotonic() - t0
+        now = time.time()
+        cands = self.ingest(a, r, now)
+        a["samples"] += 1
+        a["last_sample"] = now
+        if a["perfil"] == "detalhado" and cands:
+            self.explain(a, max(cands, key=lambda c: c[0]), now)
+        if (dt > 1.0 or dt > 0.02 * a["interval"]) and a["interval"] < PROF_SAMPLE_MAX:
+            a["interval"] = min(PROF_SAMPLE_MAX, a["interval"] * 2)
+            a["overhead_alerta"] = True
+            self.lim(a, "amostragem lenta (%.1f s): intervalo aumentado para %d s para não pesar no banco"
+                     % (dt, a["interval"]))
+        self.next["sample"] = time.time() + a["interval"]
+
+    def ingest(self, a, rows, now):
+        act, tq = self.act, a["cap"].get("tq") or 1024
+        c = {"active": 0, "idle_tx": 0, "waiting": 0, "total": 0, "maxq": 0.0}
+        by_pid, cands = {}, []
+        for r in rows:
+            pid, user, app, _dat, _addr, state, wtype, wev, xs, qs, blockers, q = r[:12]
+            if app == PROF_APP or (len(r) > 12 and r[12] is not None and r[12] != "client backend"):
+                continue
+            c["total"] += 1
+            by_pid[pid] = r
+            if state is None:
+                act["noperm"] += 1
+                continue
+            xs, qs = prof_num(xs), prof_num(qs) or 0.0
+            if state.startswith("idle in transaction"):
+                c["idle_tx"] += 1
+            if xs is not None and xs >= PROF_LONG_XACT and (state == "active" or state.startswith("idle in transaction")):
+                lk = "%s:%d" % (pid, int(now - xs))
+                cur = act["long"].get(lk)
+                if cur is None or xs > cur["xact_s"]:
+                    act["long"][lk] = {"pid": pid, "user": user, "app": app, "state": state, "xact_s": round(xs),
+                                       "q": (q or "")[:1000]}
+                if len(act["long"]) > 200:
+                    act["long"] = dict(sorted(act["long"].items(), key=lambda x: -x[1]["xact_s"])[:50])
+            if state != "active":
+                continue
+            c["active"] += 1
+            c["maxq"] = max(c["maxq"], qs)
+            key = prof_key(q)
+            e = act["seen"].get(key)
+            if e is None:
+                if len(act["seen"]) >= PROF_ACT_MAX:
+                    act["outros"] += 1
+                    e = None
+                else:
+                    e = act["seen"][key] = {"q": (q or "")[:tq], "n": 0, "max_s": 0.0, "lock_n": 0, "users": [],
+                                            "apps": [], "waits": {}, "first": now}
+            if e is not None:
+                e["n"] += 1
+                e["max_s"] = max(e["max_s"], qs)
+                e["last"] = now
+                for f, v in (("users", user), ("apps", app)):
+                    if v and v not in e[f] and len(e[f]) < 5:
+                        e[f].append(v)
+            if wtype:
+                ev = "%s:%s" % (wtype, wev)
+                act["waits"][ev] = act["waits"].get(ev, 0) + 1
+                if e is not None:
+                    e["waits"][ev] = e["waits"].get(ev, 0) + 1
+            if wtype == "Lock":
+                c["waiting"] += 1
+                if e is not None:
+                    e["lock_n"] += 1
+                for b in re.findall(r"\d+", blockers or ""):
+                    br = by_pid.get(b)
+                    bq = br[11] if br is not None else None
+                    bk = "%s>%s" % (key, prof_key(bq) if bq else b)
+                    be = act["blocking"].get(bk)
+                    if be is None and len(act["blocking"]) < 200:
+                        be = act["blocking"][bk] = {"n": 0, "max_s": 0.0, "evento": wev, "blocked": (q or "")[:1000],
+                                                    "blocker": (bq or "(pid %s)" % b)[:1000]}
+                    if be is not None:
+                        be["n"] += 1
+                        be["max_s"] = max(be["max_s"], qs)
+            if qs >= PROF_SLOW_S and key not in act["plans_done"] and len(act["plans"]) < PROF_PLANS and q:
+                cands.append((qs, key, q))
+        # bloqueadores que estavam depois do bloqueado na lista: segunda passada barata para os textos
+        for be in act["blocking"].values():
+            m = re.match(r"\(pid (\d+)\)$", be["blocker"])
+            if m and m.group(1) in by_pid and by_pid[m.group(1)][11]:
+                be["blocker"] = by_pid[m.group(1)][11][:1000]
+        act["peak"] = max(act["peak"], c["total"])
+        m = str(int(now // 60 * 60))
+        s = act["series"].get(m) or [0, 0, 0, 0, 0, 0, 0.0]
+        act["series"][m] = [s[0] + 1, s[1] + c["active"], max(s[2], c["active"]), max(s[3], c["total"]),
+                            max(s[4], c["idle_tx"]), max(s[5], c["waiting"]), max(s[6], round(c["maxq"], 1))]
+        return cands
+
+    def explain(self, a, cand, now):
+        """Perfil detalhado: EXPLAIN (sem ANALYZE) de um SELECT visto ativo por ≥ 1 s (no máximo um por amostra)."""
+        qs, key, q = cand
+        act = self.act
+        act["plans_done"].append(key)
+        if not prof_explainable(q, a["cap"].get("tq") or 1024):
+            return
+        try:
+            _, r = self.rows("explain", "EXPLAIN " + q, timeout=PROF_EXPLAIN_MS)
+        except DbError as e:
+            if getattr(e, "broken", False):
+                raise
+            act["explain_fail"] += 1
+            self.lim(a, "alguns EXPLAIN falharam (ex.: %s); o plano usa o search_path da conexão do monitor" % clip(str(e), 200))
+            return
+        act["plans"].append({"key": key, "sql": q, "plan": prof_cut("\n".join(x[0] or "" for x in r), PROF_PLAN_MAX,
+                                                                     "planos", None),
+                             "captured_at": utc_iso(now), "duration_s": round(qs, 1)})
+
+    # ---- fotos ----
+    def snapshot(self, a):
+        cap, n = a["cap"], len(a["snaps"])
+        s = {"n": n, "t": time.time(), "ms": int(self.live.server_now() * 1000), "errors": {}}
+        _, r = self.rows("foto", "SELECT pg_postmaster_start_time()::text")
+        s["postmaster"] = r[0][0]
+        parts = []
+        if cap.get("pgss"):
+            parts.append(("pgss", self.snap_pgss))
+        parts += [("tables", lambda: self.snap_rows("tabelas", PROF_TAB_SQL, PROF_TAB_COLS)),
+                  ("indexes", lambda: self.snap_rows("indices", PROF_IDX_SQL, PROF_IDX_COLS)),
+                  ("funcs", lambda: self.snap_rows("funcoes", PROF_FN_SQL, PROF_FN_COLS)),
+                  ("db", lambda: self.snap_one("banco", "SELECT * FROM pg_stat_database WHERE datname = current_database()")),
+                  ("bgw", lambda: self.snap_one("bgwriter", "SELECT * FROM pg_stat_bgwriter"))]
+        if cap.get("pg_num", 0) >= 170000:
+            parts.append(("ckpt", lambda: self.snap_one("checkpointer", "SELECT * FROM pg_stat_checkpointer")))
+        if cap.get("pgss_info"):
+            parts.append(("pgss_info", lambda: self.snap_one("pgss_info", "SELECT dealloc, stats_reset::text FROM %s."
+                                                             "pg_stat_statements_info" % cap["nsp"])))
+        for name, fn in parts:
+            try:
+                s[name] = fn()
+            except DbError as e:
+                if getattr(e, "broken", False):
+                    raise
+                s["errors"][name] = clip(str(e), 300)
+                self.lim(a, "foto: %s indisponível (%s)" % (name, clip(str(e), 200)))
+        fname = "snap_%03d.json.gz" % n
+        size = self.write_gz(os.path.join(self.sdir(a["pid"]), fname), s)
+        a["snaps"].append({"n": n, "t": s["t"], "ms": s["ms"], "file": fname, "bytes": size})
+        if n == 0:
+            self.s0 = s
+        self.trim_snaps(a)
+        self.progress(a, s)
+        self.save()
+        return s
+
+    def snap_pgss(self):
+        cap = self.st["active"]["cap"]
+        phys = cap["pgss_cols"]
+        sel = ["userid::text", "dbid::text", "queryid::text"] + (["toplevel::text"] if cap.get("toplevel") else [])
+        sql = "SELECT %s FROM %s.pg_stat_statements(false)" % (", ".join(sel + [p for _, p in phys]), cap["nsp"])
+        _, r = self.rows("pgss", sql, max_bytes=256 << 20)
+        k0, rows, hidden = len(sel), {}, 0
+        for x in r:
+            if x[2] is None:
+                hidden += 1
+                continue
+            rows[":".join(v or "" for v in x[:k0])] = [prof_num(v) for v in x[k0:]]
+        return {"cols": [lg for lg, _ in phys], "rows": rows, "hidden": hidden}
+
+    def snap_rows(self, name, sql, cols):
+        _, r = self.rows(name, sql, max_bytes=256 << 20)
+        return {"cols": list(cols), "rows": {x[0]: [v if c in PROF_TEXT_COLS else prof_num(v) for c, v in zip(cols, x)]
+                                             for x in r}}
+
+    def snap_one(self, name, sql):
+        cols, r = self.rows(name, sql)
+        return {"cols": cols, "rows": {"x": [prof_num(v) if prof_num(v) is not None else v for v in r[0]]} if r else {}}
+
+    def trim_snaps(self, a):
+        while sum(x.get("bytes", 0) for x in a["snaps"]) > PROF_SNAP_DISK_MAX and len(a["snaps"]) > 2:
+            x = a["snaps"].pop(1)
+            with contextlib.suppress(OSError):
+                os.remove(os.path.join(self.sdir(a["pid"]), x["file"]))
+            self.lim(a, "fotos intermediárias descartadas (teto de %d MB em disco): série por intervalo incompleta"
+                     % (PROF_SNAP_DISK_MAX >> 20))
+
+    def load_snap(self, a, x):
+        if x["n"] == 0 and self.s0 is not None:
+            return self.s0
+        s = self.read_gz(os.path.join(self.sdir(a["pid"]), x["file"]))
+        if x["n"] == 0:
+            self.s0 = s
+        return s
+
+    def progress(self, a, s):
+        """Contadores do progresso (prof_sessions/.../progress) a partir da foto inicial e da atual."""
+        act = self.act or {}
+        slow = len([e for e in act.get("seen", {}).values() if e["max_s"] >= PROF_SLOW_S])
+        p = {"samples": a["samples"], "snaps": len(a["snaps"]), "sql_distintos": len(act.get("seen", {})), "lentas": slow}
+        s0 = self.load_snap(a, a["snaps"][0]) if a["snaps"] else None
+        if s0 is not None and s is not None and "pgss" in s0 and "pgss" in s:
+            d = prof_delta(s0["pgss"], s["pgss"], [c for c, _ in PROF_PGSS])
+            calls = [x[0] for x in d.values() if (x[0].get("calls") or 0) > 0]
+            p["sql_distintos"] = len(calls)
+            p["execucoes"] = int(sum(x["calls"] for x in calls))
+            p["lentas"] = max(slow, len([x for x in calls if (x.get("total_ms") or 0) / x["calls"] >= 1000]))
+        a["progress"] = p
+
+    def progress_doc(self, a):
+        p = dict(a.get("progress") or {})
+        act = self.act or {}
+        p.update(samples=a["samples"], snaps=len(a["snaps"]), overhead_ms=int(a.get("overhead_ms", 0)),
+                 overhead_alerta=bool(a.get("overhead_alerta")),
+                 alertas=len(act.get("blocking", {})) + len([x for x in act.get("long", {}).values() if x["xact_s"] >= 1800]))
+        p.setdefault("sql_distintos", len(act.get("seen", {})))
+        p.setdefault("lentas", 0)
+        if a.get("last_sample"):
+            p["last_sample_at"] = int(a["last_sample"] * 1000)
+        cap = a["cap"]
+        src = ["pgss %s" % ("ok" if cap.get("pgss") else cap.get("pgss_state") or "indisponível"),
+               "atividade %s" % ("ok" if a["samples"] else "aguardando"),
+               "remessa %s" % ("ok" if cap.get("remessa") else "sem tabela")]
+        if a["perfil"] == "detalhado":
+            src.append("planos %d" % len(act.get("plans", [])))
+        p["coletas"] = clip("; ".join(src), 300)
+        return {k: (int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else v) for k, v in p.items()}
+
+    def save_act(self, a):
+        if self.act is not None:
+            self.write_gz(os.path.join(self.sdir(a["pid"]), "activity.json.gz"), self.act)
+
+    # ---- Firebase: sessão ----
+    def session_doc(self, a, final=None):
+        doc = {"state": a["state"], "by": a["by"], "perfil": a["perfil"], "duracao_min": a["duracao_min"],
+               "started_at": a["started_ms"], "deadline_at": a["deadline_ms"], "agent_version": VERSION,
+               "updated_at": PROF_SV}
+        for k in ("pg_version", "dbname"):
+            if a.get(k):
+                doc[k] = clip(a[k], 64 if k == "pg_version" else 63)
+        if a.get("stop"):
+            doc["stopped_by"] = a["stop"]["by"]
+        if a["state"] in ("ativo", "finalizando"):
+            doc["progress"] = self.progress_doc(a)
+        doc.update(final or {})
+        return doc
+
+    def publish_session(self, a, doc=None):
+        try:
+            self.live.patch("", {"prof_sessions/%s/%s" % (self.sid, a["pid"]): doc or self.session_doc(a)}, timeout=30)
+            return True
+        except CloudError:
+            return False
+
+    # ---- encerramento e consolidação ----
+    def finalize(self, a, state, motivo, use_db=True, final_snap=True):
+        pid = a["pid"]
+        self.say("Profile do banco: encerrando a sessão %s (%s)..." % (pid, motivo))
+        a["state"], a["final"] = "finalizando", {"state": state, "motivo": motivo}
+        self.save()
+        self.publish_session(a)
+        if use_db and final_snap:
+            try:
+                self.snapshot(a)
+            except DbError as e:
+                self.close_pg()
+                self.lim(a, "foto final falhou (%s): o fim do período é a última foto" % clip(str(e), 200))
+        if self.act is None:
+            self.act = self.read_gz(os.path.join(self.sdir(pid), "activity.json.gz")) or self.new_act()
+        if not use_db:
+            self.close_pg()
+        end = a["snaps"][-1] if a["snaps"] else {"t": a["started_epoch"], "ms": a["started_ms"]}
+        final = {"state": state, "motivo": motivo, "ended_at": int(end["ms"])}
+        try:
+            rep, report = self.consolidate(a, state, motivo, use_db and self.db.cfg is not None)
+            data, raw = self.encode(report, rep)
+            self.write_gz(self.report_path(pid), data)
+            final.update(summary=rep.text_summary(), alerts_n=len(rep.alerts), sql_n=int(rep.totals["sql_distintos"] or 0),
+                         report={"parts": int(math.ceil(len(base64.b64encode(data)) / float(PROF_PART))),
+                                 "bytes": len(data), "raw_bytes": raw, "sha256": hashlib.sha256(data).hexdigest(),
+                                 "format": 1})
+        except Exception as e:                            # relatório impossível: a sessão fica registrada como falha
+            self.say("Profile do banco: falha ao consolidar %s (%s: %s)" % (pid, type(e).__name__, e))
+            final.update(state="falhou", error_code="interno", error=clip("falha ao consolidar o relatório: %s: %s"
+                                                                       % (type(e).__name__, e), 500))
+        a["state"] = final["state"]
+        doc = self.session_doc(a, final)
+        doc.pop("updated_at", None)
+        self.st["done"][pid] = {"doc": doc, "uploaded": False, "sent_parts": 0, "t": time.time()}
+        self.st["active"], self.act, self.s0, self.mono0 = None, None, None, None
+        self.save()
+        shutil.rmtree(self.sdir(pid), ignore_errors=True)
+        self.close_pg()
+        self.audit("fim", pid=pid, state=final["state"], motivo=motivo, stopped_by=(a.get("stop") or {}).get("by"))
+        self.say("Profile do banco: sessão %s %s." % (pid, final["state"]))
+        self.up_fails, self.up_next = 0, 0.0
+        self.ready_at = 0.0                               # prontidão de novo (sem 'active')
+        self.upload()
+
+    def consolidate(self, a, state, motivo, use_db):
+        cap, lims = a["cap"], ProfLims(a["lims"])
+        snaps = [x for x in a["snaps"]]
+        first = self.load_snap(a, snaps[0]) if snaps else None
+        if first is None:
+            raise ValueError("sem a foto inicial")
+        if len(snaps) < 2:
+            lims.add("só a foto inicial: sem diferenças das estatísticas (sessão muito curta ou foto final falhou)")
+        acc = {k: {} for k in ("pgss", "tables", "indexes", "funcs", "db", "bgw", "ckpt")}
+        counters = {"pgss": [c for c, _ in PROF_PGSS], "tables": PROF_TAB_COUNTERS, "indexes": PROF_IDX_COUNTERS,
+                    "funcs": PROF_FN_COUNTERS, "db": PROF_DB_COUNTERS, "bgw": PROF_BGW_COUNTERS, "ckpt": PROF_BGW_COUNTERS}
+        hourly, prev, last = [], first, first
+        for x in snaps[1:]:
+            cur = self.load_snap(a, x)
+            if cur is None:
+                lims.add("foto %d ilegível no disco: ignorada" % x["n"])
+                continue
+            if cur.get("postmaster") != prev.get("postmaster"):
+                lims.add("PostgreSQL reiniciado durante a sessão (início do postmaster %s): contadores podem ter sido "
+                         "zerados; diferenças marcadas" % cur.get("postmaster"))
+            pi, ci = (prev.get("pgss_info") or {}).get("rows", {}).get("x"), (cur.get("pgss_info") or {}).get("rows", {}).get("x")
+            reset_all = pi is not None and ci is not None and pi[1] != ci[1]
+            if reset_all:
+                lims.add("pg_stat_statements foi zerado por alguém durante a sessão (stats_reset mudou): SQLs desse "
+                         "intervalo contados desde o reset e marcados como não confiáveis")
+            elif pi is not None and ci is not None and (prof_num(ci[0]) or 0) > (prof_num(pi[0]) or 0):
+                lims.add("pg_stat_statements despejou %d entradas (pg_stat_statements.max cheio): parte da atividade "
+                         "não foi contada" % ((prof_num(ci[0]) or 0) - (prof_num(pi[0]) or 0)))
+            h = {"fim": utc_iso(cur["t"]), "min": round((cur["t"] - prev["t"]) / 60.0, 1)}
+            for src, cs in counters.items():
+                if src not in prev or src not in cur:
+                    continue
+                base = {"cols": cur[src]["cols"], "rows": {}} if src == "pgss" and reset_all else prev[src]
+                d = prof_delta(base, cur[src], cs)
+                if src == "pgss":
+                    gone = len(set(prev[src]["rows"]) - set(cur[src]["rows"]))
+                    if gone:
+                        lims.add("entradas do pg_stat_statements sumiram entre fotos (despejo/reset): atividade delas "
+                                 "entre a última foto e o despejo não foi contada")
+                    tops = sorted(d.items(), key=lambda kv: -(kv[1][0].get("total_ms") or 0))[:3]
+                    h.update(calls=int(sum(v[0].get("calls") or 0 for v in d.values())),
+                             total_ms=round(sum(v[0].get("total_ms") or 0 for v in d.values()), 1),
+                             shared_read=int(sum(v[0].get("shared_read") or 0 for v in d.values())),
+                             temp_written=int(sum(v[0].get("temp_written") or 0 for v in d.values())),
+                             top_keys=[k for k, _ in tops])
+                    if reset_all:
+                        d = {k: (v[0], v[1], True) for k, v in d.items()}
+                if src == "db" and d.get("x"):
+                    h["db"] = {c: v for c, v in d["x"][0].items() if v}
+                for k, (dd, new, reset) in d.items():
+                    prof_add(acc[src], k, dd, new or (src == "pgss" and k not in first.get("pgss", {}).get("rows", {})), reset)
+            hourly.append(h)
+            prev = last = cur
+        if (first.get("pgss") or {}).get("hidden") or (last.get("pgss") or {}).get("hidden"):
+            lims.add("%d entradas do pg_stat_statements sem queryid visível (consultas de outros usuários sem "
+                     "permissão de leitura)" % max(first["pgss"].get("hidden", 0), last["pgss"].get("hidden", 0)))
+        for k in first.get("errors") or {}:
+            lims.add("foto inicial sem %s" % k)
+        names, texts, meta = {"users": {}, "dbs": {}}, {}, {}
+        pgss_acc = acc["pgss"]
+        cand_keys = set()
+        for metric in ("total_ms", "calls", "io", "mean"):
+            def val(kv, metric=metric):
+                d = kv[1][0]
+                if metric == "io":
+                    return sum(d.get(c) or 0 for c in ("shared_read", "local_read", "temp_read", "temp_written"))
+                if metric == "mean":
+                    return (d.get("total_ms") or 0) / d["calls"] if (d.get("calls") or 0) > 0 else 0
+                return d.get(metric) or 0
+            cand_keys.update(k for k, _ in sorted(pgss_acc.items(), key=lambda kv: -val(kv))[:150])
+        lrows, lcols = (last.get("pgss") or {}).get("rows", {}), (last.get("pgss") or {}).get("cols", [])
+        for k in cand_keys:
+            p = k.split(":")
+            m = {"userid": p[0], "dbid": p[1], "queryid": p[2]}
+            if len(p) > 3:
+                m["toplevel"] = prof_bool(p[3])
+            row = lrows.get(k)
+            for g in ("min_ms", "max_ms"):
+                if row is not None and g in lcols:
+                    m[g] = row[lcols.index(g)]
+            meta[k] = m
+        if use_db:
+            try:
+                _, r = self.rows("usuarios", "SELECT oid::text, rolname FROM pg_roles")
+                names["users"] = dict(r)
+                _, r = self.rows("bancos", "SELECT oid::text, datname FROM pg_database")
+                names["dbs"] = dict(r)
+            except DbError as e:
+                lims.add("nomes de usuários/bancos indisponíveis (%s)" % clip(str(e), 200))
+            if cap.get("pgss") and cand_keys:
+                try:
+                    qids = sorted({meta[k]["queryid"] for k in cand_keys})
+                    sel = "userid::text, dbid::text, queryid::text" + (", toplevel::text" if cap.get("toplevel") else "")
+                    _, r = self.rows("pgss_textos", "SELECT %s, query FROM %s.pg_stat_statements(true) WHERE queryid = "
+                                                    "ANY($1::bigint[])" % (sel, cap["nsp"]),
+                                     ["{" + ",".join(qids) + "}"], max_bytes=256 << 20)
+                    for x in r:
+                        texts[":".join(v or "" for v in x[:-1])] = x[-1]
+                except DbError as e:
+                    lims.add("textos dos SQLs indisponíveis (%s)" % clip(str(e), 200))
+        elif cap.get("pgss"):
+            lims.add("sem acesso ao PostgreSQL no encerramento: textos dos SQLs, estrutura e funções indisponíveis")
+        tl = last.get("tables") or {"cols": list(PROF_TAB_COLS), "rows": {}}
+        tindex = {}
+        for relid, r in tl["rows"].items():
+            for t in (r[2].lower(), ("%s.%s" % (r[1], r[2])).lower()):
+                tindex.setdefault(t, []).append(relid)
+        act = self.act or self.new_act()
+        plan_keys = {p["key"]: "Seq Scan" in (p.get("plan") or "") for p in act.get("plans", [])}
+        ident = self.ident_doc(a, state, motivo, last)
+        sources = {"pg_stat_statements": "ok" if cap.get("pgss") else "indisponivel: %s" % (cap.get("pgss_state") or "?"),
+                   "pg_stat_activity": "ok (%d amostras)" % a["samples"] if a["samples"] else "indisponivel: sem amostras",
+                   "estatisticas_tabelas": "ok" if "tables" in first else "indisponivel",
+                   "funcoes": "ok" if (first.get("funcs") or {}).get("rows") else "indisponivel: track_functions = none ou sem chamadas",
+                   "remessas_c2": "ok" if cap.get("remessa") else "indisponivel: sem admin.log_imp_txt_seg",
+                   "planos": ("ok (%d)" % len(act.get("plans", []))) if a["perfil"] == "detalhado" else "indisponivel: perfil leve",
+                   "log_sql_lento": "ok" if a.get("log_offsets") else "indisponivel: não configurado/legível ou perfil leve"}
+        rep = ProfReport(ident, lims, sources, cap.get("settings") or [], cap.get("block") or 8192)
+        cand = rep.set_statements(pgss_acc, texts, meta, names, cap.get("own_user"), act.get("seen", {}), tindex, plan_keys)
+        rep.finish_statements(cand, acc["tables"])
+        ids = {}
+        for s in rep.stmts:
+            ids.setdefault("%s:%s:%s" % (s["userid"], s["dbid"], s["queryid"]), s["id"])
+        for h in hourly:
+            h["top"] = [ids.get(":".join(k.split(":")[:3]), "?") for k in h.pop("top_keys", [])]
+        rep.hourly = hourly
+        # tabelas: maiores diferenças + as citadas pelos SQLs
+        tdel = acc["tables"]
+        rels = []
+
+        def push(xs):
+            for x in xs:
+                if x not in rels and len(rels) < PROF_TABLES_MAX:
+                    rels.append(x)
+        for crit in ("seq_tup_read", "seq_scan", "idx_scan", "heap_blks_read", "mods"):
+            key = (lambda kv: -sum(kv[1][0].get(c) or 0 for c in ("n_tup_ins", "n_tup_upd", "n_tup_del"))) if crit == "mods" \
+                else (lambda kv, c=crit: -(kv[1][0].get(c) or 0))
+            push([k for k, v in sorted(tdel.items(), key=key)[:25] if key((k, v)) < 0])
+        refs = {}
+        for s in rep.stmts:
+            for r in s.get("_rels") or ():
+                refs.setdefault(r, []).append(s["id"])
+        push(sorted(refs, key=lambda r: -len(refs[r])))
+        ci = {c: i for i, c in enumerate(tl["cols"])}
+        push([k for k, r in sorted(tl["rows"].items(), key=lambda kv: -(prof_num(kv[1][ci["n_dead_tup"]]) or 0))[:15]
+              if (prof_num(r[ci["n_dead_tup"]]) or 0) > 0])
+        struct = self.structure(rels, lims) if use_db and rels else {}
+        rep.set_tables(rels, tl, tdel, struct, last.get("indexes") or {"cols": list(PROF_IDX_COLS), "rows": {}},
+                       acc["indexes"], refs)
+        fns, defs, frefs, trig = self.functions(rep, acc["funcs"], struct, lims) if use_db else ([], {}, {}, {})
+        rep.set_functions(fns, acc["funcs"], defs, frefs, trig)
+        tn = {relid: "%s.%s" % (r[1], r[2]) for relid, r in tl["rows"].items()}
+        skey = {}
+        for s in rep.stmts:
+            s["tables"] = [tn[r] for r in s.pop("_rels", None) or () if r in tn]
+            if s.get("query"):
+                skey.setdefault(prof_key(s["query"]), s["id"])
+        rep.activity = self.act_summary(a, act)
+        rep.plans = [dict({k: p[k] for k in ("sql", "plan", "captured_at", "duration_s")}, key=skey.get(p["key"]))
+                     for p in act.get("plans", [])]
+        if a.get("log_offsets"):
+            rep.slow_log = self.read_slow_log(a, lims)
+        if cap.get("remessa") and use_db:
+            rep.remessas = self.remessas(a["started_epoch"], end_epoch=snaps[-1]["t"] if snaps else time.time(), lims=lims)
+        res = prof_resources(self.cloud.log, a["started_epoch"], snaps[-1]["t"] if snaps else time.time())
+        res = res or {"windows": 0}
+        osd = os_info()
+        if osd.get("virtualization") and osd.get("virtualization") != "none":
+            res["virt_note"] = ("servidor virtualizado (%s): latência/utilização de disco são as do disco virtual "
+                                "apresentado à VM; contenção no host/storage não é visível daqui" % osd["virtualization"])
+            lims.add(res["virt_note"])
+        rep.resources = res
+        dbd = (acc["db"].get("x") or [{}])[0]
+        bg = dict((acc["bgw"].get("x") or [{}])[0])
+        bg.update((acc["ckpt"].get("x") or [{}])[0])
+        hit, rd = dbd.get("blks_hit") or 0, dbd.get("blks_read") or 0
+        rep.database = {"delta": {c: v for c, v in dbd.items() if v}, "bgwriter": {c: v for c, v in bg.items() if v},
+                        "cache_hit_ratio": round(hit / float(hit + rd), 4) if hit + rd else None}
+        cfg = {"pgss": cap.get("pgss_state"), "pgss_track": cap.get("pgss_track")}
+        rep.build_alerts(cfg)
+        if a.get("overhead_alerta"):
+            rep.alerts.append({"nivel": "info", "titulo": "Amostragem desacelerada por overhead",
+                               "evidencia": "a consulta ao pg_stat_activity demorou; intervalo aumentado"})
+        report = rep.to_dict(cfg)
+        return rep, report
+
+    def ident_doc(self, a, state, motivo, last):
+        osd = os_info()
+        end = a["snaps"][-1]["t"] if a["snaps"] else a["started_epoch"]
+        ms_end = a["snaps"][-1]["ms"] if a["snaps"] else a["started_ms"]
+        loc = lambda t: datetime.datetime.fromtimestamp(t).astimezone().isoformat(timespec="seconds")
+        return {"company": self.ident.company, "server": self.ident.name or self.cloud.host, "sid": self.sid,
+                "os": osd.get("pretty") or osd.get("name") or osd.get("family"), "virt": osd.get("virtualization"),
+                "pg_version": a.get("pg_version"), "pg_num": a["cap"].get("pg_num"), "dbname": a.get("dbname"),
+                "started_at": a["started_ms"], "ended_at": ms_end, "started_at_iso": loc(a["started_epoch"]),
+                "ended_at_iso": loc(end), "duration_s": round(end - a["started_epoch"]), "duracao_min": a["duracao_min"],
+                "perfil": a["perfil"], "status": state, "motivo": motivo, "by": a["by"],
+                "stopped_by": (a.get("stop") or {}).get("by"), "agent_version": VERSION, "postmaster_start": last.get("postmaster")}
+
+    def act_summary(self, a, act):
+        series = [{"minuto": utc_iso(int(m)), "amostras": v[0], "ativas_media": round(v[1] / float(v[0]), 2) if v[0] else 0,
+                   "ativas_max": v[2], "conexoes_max": v[3], "idle_in_tx_max": v[4], "esperando_lock_max": v[5],
+                   "maior_consulta_s": v[6]} for m, v in sorted(act.get("series", {}).items(), key=lambda kv: int(kv[0]))]
+        seen = sorted(act.get("seen", {}).values(), key=lambda e: (-e["n"], -e["max_s"]))[:100]
+        if act.get("noperm"):
+            self.lim(a, "%d ocorrências de sessões de outros usuários sem permissão de leitura no pg_stat_activity"
+                     % act["noperm"])
+        return {"interval_s": PROF_SAMPLE[a["perfil"]] if a["interval"] == PROF_SAMPLE[a["perfil"]] else
+                "%d (aumentado para %d por overhead)" % (PROF_SAMPLE[a["perfil"]], a["interval"]),
+                "samples": a["samples"], "max_connections": a["cap"].get("max_connections"), "peak_connections": act.get("peak", 0),
+                "series": series, "outros": act.get("outros", 0),
+                "top_seen": [{"q": e["q"], "n": e["n"], "max_s": round(e["max_s"], 1), "lock_n": e.get("lock_n", 0),
+                              "users": e.get("users"), "apps": e.get("apps"),
+                              "waits": dict(sorted(e.get("waits", {}).items(), key=lambda kv: -kv[1])[:5])} for e in seen],
+                "waits": [{"evento": k, "n": v} for k, v in sorted(act.get("waits", {}).items(), key=lambda kv: -kv[1])],
+                "long_xacts": sorted(act.get("long", {}).values(), key=lambda x: -x["xact_s"])[:50],
+                "blocking": sorted(act.get("blocking", {}).values(), key=lambda b: (-b["n"], -b["max_s"]))[:100]}
+
+    def structure(self, rels, lims):
+        arr = ["{" + ",".join(rels) + "}"]
+        st = {r: {"columns": [], "constraints": [], "indexes": {}, "triggers": []} for r in rels}
+        cons = {"p": "primary key", "u": "unique", "f": "foreign key", "c": "check", "x": "exclusion", "t": "trigger"}
+
+        def part(name, sql, fn, quiet=False):
+            try:
+                _, r = self.rows(name, sql, arr, max_bytes=128 << 20)
+            except DbError as e:
+                if getattr(e, "broken", False):
+                    raise
+                if not quiet:
+                    lims.add("estrutura: %s indisponível (%s)" % (name, clip(str(e), 200)))
+                return False
+            for x in r:
+                if x[0] in st:
+                    fn(st[x[0]], x)
+            return True
+
+        part("colunas", "SELECT a.attrelid::text, a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull::text "
+                        "FROM pg_attribute a WHERE a.attrelid = ANY($1::oid[]) AND a.attnum > 0 AND NOT a.attisdropped "
+                        "ORDER BY a.attrelid, a.attnum",
+             lambda t, x: t["columns"].append({"name": x[1], "type": x[2], "notnull": prof_bool(x[3])}))
+
+        def stat(t, x):
+            for c in t["columns"]:
+                if c["name"] == x[1]:
+                    c.update(null_frac=prof_num(x[2]), avg_width=prof_num(x[3]), n_distinct=prof_num(x[4]),
+                             correlation=prof_num(x[5]))
+        part("estatisticas", "SELECT c.oid::text, s.attname, s.null_frac, s.avg_width, s.n_distinct, s.correlation "
+                             "FROM pg_stats s JOIN pg_namespace n ON n.nspname = s.schemaname JOIN pg_class c ON "
+                             "c.relnamespace = n.oid AND c.relname = s.tablename WHERE c.oid = ANY($1::oid[])", stat)
+        part("constraints", "SELECT conrelid::text, conname, contype::text, pg_get_constraintdef(oid) FROM pg_constraint "
+                            "WHERE conrelid = ANY($1::oid[]) ORDER BY conrelid, conname",
+             lambda t, x: t["constraints"].append({"name": x[1], "type": cons.get(x[2], x[2]), "def": x[3]}))
+
+        def idx(t, x):
+            keys = (x[8] or "").split()
+            t["indexes"][x[1]] = {"def": x[2], "unique": prof_bool(x[3]), "primary": prof_bool(x[4]),
+                                  "valid": prof_bool(x[5]), "partial": prof_bool(x[6]), "am": x[7],
+                                  "expression": prof_bool(x[9]),
+                                  "keys": None if (prof_bool(x[6]) or prof_bool(x[9]) or "0" in keys) else keys}
+        if not part("indices_def", "SELECT i.indrelid::text, i.indexrelid::text, pg_get_indexdef(i.indexrelid), "
+                                   "i.indisunique::text, i.indisprimary::text, i.indisvalid::text, (i.indpred IS NOT NULL)::text, "
+                                   "am.amname, i.indkey::text, (i.indexprs IS NOT NULL)::text FROM pg_index i JOIN pg_class c "
+                                   "ON c.oid = i.indexrelid JOIN pg_am am ON am.oid = c.relam WHERE i.indrelid = ANY($1::oid[])",
+                    idx, quiet=True):
+            # pg_get_indexdef espera o lock da tabela (visto com ACCESS EXCLUSIVE, como o TRUNCATE da remessa): monta a
+            # definição só pelo catálogo, sem lock (expressões e predicados ficam indicados, sem o texto)
+            part("indices_catalogo", "SELECT i.indrelid::text, i.indexrelid::text, 'CREATE ' || CASE WHEN i.indisunique "
+                                     "THEN 'UNIQUE ' ELSE '' END || 'INDEX ' || c.relname || ' ON ' || n.nspname || '.' || "
+                                     "t.relname || ' USING ' || am.amname || ' (' || coalesce((SELECT string_agg(CASE WHEN "
+                                     "k.a = 0 THEN '<expressão>' ELSE a.attname END, ', ' ORDER BY k.o) FROM unnest(i.indkey::int2[]) "
+                                     "WITH ORDINALITY k(a, o) LEFT JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.a), "
+                                     "'') || ')' || CASE WHEN i.indpred IS NOT NULL THEN ' WHERE <predicado>' ELSE '' END, "
+                                     "i.indisunique::text, i.indisprimary::text, i.indisvalid::text, (i.indpred IS NOT NULL)::text, "
+                                     "am.amname, i.indkey::text, (i.indexprs IS NOT NULL)::text FROM pg_index i JOIN pg_class c "
+                                     "ON c.oid = i.indexrelid JOIN pg_class t ON t.oid = i.indrelid JOIN pg_namespace n ON "
+                                     "n.oid = t.relnamespace JOIN pg_am am ON am.oid = c.relam WHERE i.indrelid = ANY($1::oid[])", idx)
+            lims.add("definição de índices montada pelo catálogo (pg_get_indexdef esperou lock de tabela em uso): "
+                     "expressões/predicados aparecem como <expressão>/<predicado>")
+        part("triggers", "SELECT t.tgrelid::text, t.tgname, t.tgfoid::text, pg_get_triggerdef(t.oid), t.tgenabled::text "
+                         "FROM pg_trigger t WHERE NOT t.tgisinternal AND t.tgrelid = ANY($1::oid[])",
+             lambda t, x: t["triggers"].append({"name": x[1], "funcoid": x[2], "def": x[3], "enabled": x[4]}))
+        part("reloptions", "SELECT c.oid::text, c.reloptions::text FROM pg_class c WHERE c.oid = ANY($1::oid[]) "
+                           "AND c.reloptions IS NOT NULL", lambda t, x: t.update(reloptions=x[1]))
+        return st
+
+    def functions(self, rep, fdelta, struct, lims):
+        try:
+            _, r = self.rows("funcoes_lista", "SELECT p.oid::text, n.nspname, p.proname, "
+                                              "pg_get_function_identity_arguments(p.oid), l.lanname, p.provolatile::text, "
+                                              "p.prosecdef::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+                                              "JOIN pg_language l ON l.oid = p.prolang WHERE n.nspname NOT IN "
+                                              "('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg\\_%' "
+                                              "AND l.lanname IN ('sql', 'plpgsql')", max_bytes=128 << 20)
+        except DbError as e:
+            if getattr(e, "broken", False):
+                raise
+            lims.add("funções indisponíveis (%s)" % clip(str(e), 200))
+            return [], {}, {}, {}
+        allf = {x[0]: {"schema": x[1], "name": x[2], "args": x[3], "lang": x[4],
+                       "volatility": {"i": "immutable", "s": "stable", "v": "volatile"}.get(x[5], x[5]),
+                       "security_definer": prof_bool(x[6])} for x in r}
+        byname = {}
+        for oid, m in allf.items():
+            byname.setdefault(m["name"].lower(), []).append(oid)
+        chosen, refs, trig = [], {}, {}
+
+        def push(oid):
+            if oid in allf and oid not in chosen and len(chosen) < PROF_FUNCS:
+                chosen.append(oid)
+        for oid, _ in sorted(fdelta.items(), key=lambda kv: -(kv[1][0].get("total_ms") or 0))[:30]:
+            push(oid)
+        for s in rep.stmts:
+            for nm in set(_PROF_CALL.findall(prof_norm(s.get("query") or ""))):
+                for oid in byname.get(nm, ())[:3]:
+                    refs.setdefault(oid, []).append(s["id"])
+        for oid in sorted(refs, key=lambda o: -len(refs[o])):
+            push(oid)
+        for relid, t in struct.items():
+            for g in t.get("triggers") or ():
+                trig.setdefault(g["funcoid"], []).append("%s em %s" % (g["name"], relid))
+                push(g["funcoid"])
+        defs = {}
+        if chosen:
+            try:
+                _, r = self.rows("funcoes_def", "SELECT p.oid::text, pg_get_functiondef(p.oid) FROM pg_proc p "
+                                                "WHERE p.oid = ANY($1::oid[])", ["{" + ",".join(chosen) + "}"],
+                                 max_bytes=128 << 20)
+                defs = dict(r)
+            except DbError as e:
+                if getattr(e, "broken", False):
+                    raise
+                lims.add("definições de função indisponíveis (%s)" % clip(str(e), 200))
+        return [(oid, allf[oid]) for oid in chosen], defs, refs, trig
+
+    def remessas(self, t0, end_epoch, lims):
+        try:
+            _, r = self.rows("remessas", "SELECT row_to_json(l)::text, extract(epoch from (l.data_fim - l.data_ini)) FROM "
+                                         "admin.log_imp_txt l WHERE l.data_ini <= to_timestamp($2)::timestamp AND "
+                                         "l.data_fim >= to_timestamp($1)::timestamp ORDER BY l.data_ini LIMIT 500",
+                             [t0, end_epoch])
+            out = []
+            for x in r:
+                d = json.loads(x[0])
+                d["dur_s"] = prof_num(x[1])
+                d["segmentos"] = []
+                out.append(d)
+            if out:
+                _, r = self.rows("remessas_etapas", "SELECT row_to_json(s)::text, extract(epoch from (s.data_fim - s.data_ini)), "
+                                                    "extract(epoch from s.tempo_em_pausa) FROM admin.log_imp_txt_seg s "
+                                                    "WHERE s.cod_log_imp_txt = ANY($1::numeric[]) ORDER BY s.cod LIMIT 20000",
+                                 ["{" + ",".join(str(d.get("cod")) for d in out) + "}"], max_bytes=64 << 20)
+                by = {str(d.get("cod")): d for d in out}
+                for x in r:
+                    s = json.loads(x[0])
+                    s["dur_s"], s["pausa_s"] = prof_num(x[1]), prof_num(x[2])
+                    if isinstance(s.get("obs"), str):
+                        s["obs"] = s["obs"][:500]
+                    p = by.get(str(s.get("cod_log_imp_txt")))
+                    if p is not None:
+                        p["segmentos"].append(s)
+            return out
+        except (DbError, ValueError) as e:
+            if getattr(e, "broken", False):
+                raise
+            lims.add("remessas C2 indisponíveis (%s)" % clip(str(e), 200))
+            return []
+
+    def read_slow_log(self, a, lims):
+        """Trecho do log do PostgreSQL desde o início da sessão: entradas 'duration:' (log_min_duration_statement /
+        auto_explain já configurados pelo administrador) com as linhas de continuação."""
+        out, budget, cur = [], PROF_SLOWLOG_MAX, None
+        for path, off in sorted(a["log_offsets"].items()):
+            try:
+                size = os.path.getsize(path)
+                with open(path, "rb") as f:
+                    f.seek(off if size >= off else 0)
+                    data = f.read(budget)
+            except OSError as e:
+                lims.add("log do PostgreSQL ilegível (%s)" % e)
+                continue
+            budget -= len(data)
+            for line in data.decode("utf-8", "replace").splitlines():
+                if "duration:" in line:
+                    cur = [line]
+                    out.append(cur)
+                elif cur is not None and line[:1] in ("\t", " ") and len(cur) < 500:
+                    cur.append(line)
+                else:
+                    cur = None
+            if budget <= 0:
+                lims.add("log de SQL lento: lidos só os primeiros %d MB do período" % (PROF_SLOWLOG_MAX >> 20))
+                break
+        dur = lambda e: prof_num((re.search(r"duration: ([0-9.]+)", e[0]) or [None, None])[1])
+        if len(out) > 2000:
+            lims.add("log de SQL lento: %d entradas; mantidas as 2000 mais lentas" % len(out))
+            out = sorted(out, key=lambda e: -(dur(e) or 0))[:2000]
+        return [{"duration_ms": dur(e), "text": prof_cut("\n".join(e), 20000, "entradas do log", lims)} for e in out]
+
+    def encode(self, report, rep):
+        """JSON (com os dois Markdowns) -> gzip, reduzindo em etapas (e registrando) se passar de 64 partes."""
+        cap = PROF_MAX_PARTS * PROF_PART * 3 // 4
+        steps = (("definições de função removidas (relatório grande demais)", lambda: [f.pop("definition", None) for f in rep.functions]),
+                 ("planos removidos (relatório grande demais)", lambda: rep.plans.clear()),
+                 ("SQLs além dos 200 de maior tempo removidos (relatório grande demais)", lambda: self.cut_stmts(rep, 200)),
+                 ("colunas/estatísticas das tabelas removidas (relatório grande demais)",
+                  lambda: [t.pop(c, None) for t in rep.tables for c in ("columns", "stats")]),
+                 ("série por minuto da atividade removida (relatório grande demais)", lambda: rep.activity.pop("series", None)))
+        i = 0
+        while True:
+            report["markdown"] = prof_markdown(report)
+            report["markdown_resumo"] = prof_markdown(report, resumo=True)
+            raw = json.dumps(report, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            data = gzip.compress(raw, 6)
+            if len(data) <= cap or i >= len(steps):
+                if len(data) > cap:
+                    raise ValueError("relatório grande demais mesmo reduzido (%d bytes)" % len(data))
+                return data, len(raw)
+            msg, fn = steps[i]
+            fn()
+            rep.lims.add(msg)
+            report = dict(report, limitations=list(rep.lims.items), statements=rep.stmts, rankings=rep.rankings,
+                          functions=rep.functions, plans=rep.plans, tables=rep.tables, activity=rep.activity)
+            i += 1
+
+    @staticmethod
+    def cut_stmts(rep, n):
+        keep = rep.stmts[:n]
+        ids = {s["id"] for s in keep}
+        rep.stmts = keep
+        rep.rankings = {k: [i for i in v if i in ids] for k, v in rep.rankings.items()}
+
+    # ---- envio do relatório ----
+    def upload(self):
+        for pid in sorted(self.st["done"]):
+            d = self.st["done"][pid]
+            if d.get("uploaded") or self.stop_ev.is_set():
+                continue
+            doc = dict(d["doc"], updated_at=PROF_SV)
+            try:
+                rep = doc.get("report")
+                if rep:
+                    try:
+                        with open(self.report_path(pid), "rb") as f:
+                            b64 = base64.b64encode(f.read()).decode("ascii")
+                    except OSError:
+                        doc.pop("report")
+                        d["doc"].pop("report", None)
+                        doc.update(error_code="interno", error="relatório local perdido antes do envio")
+                        b64 = ""
+                    parts = [b64[i:i + PROF_PART] for i in range(0, len(b64), PROF_PART)]
+                    for i in range(d.get("sent_parts", 0), len(parts), PROF_UP_PARTS):
+                        if self.stop_ev.is_set():
+                            return
+                        self.live.patch("", {"prof_reports/%s/%s/%d" % (self.sid, pid, j): parts[j]
+                                             for j in range(i, min(len(parts), i + PROF_UP_PARTS))}, timeout=120)
+                        d["sent_parts"] = min(len(parts), i + PROF_UP_PARTS)
+                        self.save()
+                self.live.patch("", {"prof_sessions/%s/%s" % (self.sid, pid): doc}, timeout=30)
+            except CloudError as e:
+                self.up_fails += 1
+                self.up_next = time.time() + min(PROF_RETRY[1], PROF_RETRY[0] * 2 ** (self.up_fails - 1))
+                self.say("Profile do banco: envio do relatório %s falhou (%s); tenta de novo depois." % (pid, e))
+                return
+            d["uploaded"] = True
+            self.up_fails = 0
+            self.save()
+            self.say("Profile do banco: relatório %s enviado." % pid)
+
+    # ---- poda (1x por dia) ----
+    def prune(self):
+        cfg = self.ident.sync_cfg()
+        now_ms = int(self.live.server_now() * 1000)
+        a = self.st["active"]
+        try:
+            keys = sorted(k for k in (self.live.get("prof_sessions/" + self.sid, {"shallow": "true"}) or {})
+                          if PROF_ID_RE.match(k))
+            reps = sorted(k for k in (self.live.get("prof_reports/" + self.sid, {"shallow": "true"}) or {})
+                          if PROF_ID_RE.match(k))
+            acks = sorted(k for k in (self.live.get("prof_ack/" + self.sid, {"shallow": "true"}) or {})
+                          if PROF_ID_RE.match(k))
+        except CloudError:
+            self.next_prune = time.time() + 3600
+            return
+        busy = {p for p, d in self.st["done"].items() if not d.get("uploaded")} | ({a["pid"]} if a else set())
+        cut = now_ms - cfg["prof_days"] * 86400000
+        keep = {k for k in keys[-cfg["prof_keep"]:] if int(k[:13]) >= cut} | busy
+        patch = {}
+        for k in set(keys) | set(reps):
+            if k not in keep:
+                patch["prof_sessions/%s/%s" % (self.sid, k)] = None
+                patch["prof_reports/%s/%s" % (self.sid, k)] = None
+        for k in acks:
+            if int(k[:13]) < now_ms - PROF_ACK_KEEP * 1000:
+                patch["prof_ack/%s/%s" % (self.sid, k)] = None
+        try:
+            if patch:
+                self.live.patch("", patch, timeout=60)
+        except CloudError:
+            self.next_prune = time.time() + 3600
+            return
+        # cópia local: mesma retenção (e nunca a sessão ativa nem as que ainda não subiram)
+        loc = sorted(set(self.st["done"]) | {f[:-8] for f in os.listdir(self.dir) if f.endswith(".json.gz")}
+                     if os.path.isdir(self.dir) else set(self.st["done"]))
+        lkeep = {k for k in loc[-cfg["prof_keep"]:] if int(k[:13]) >= cut} | busy
+        for k in loc:
+            if k not in lkeep and PROF_ID_RE.match(k):
+                self.st["done"].pop(k, None)
+                with contextlib.suppress(OSError):
+                    os.remove(self.report_path(k))
+        if os.path.isdir(self.dir):                       # fotos de sessões que não existem mais
+            for f in os.listdir(self.dir):
+                if PROF_ID_RE.match(f) and os.path.isdir(os.path.join(self.dir, f)) and not (a and a["pid"] == f):
+                    shutil.rmtree(os.path.join(self.dir, f), ignore_errors=True)
         self.st["pruned_at"] = time.time()
         self.next_prune = self.st["pruned_at"] + 86400
         self.save()
@@ -11650,6 +14113,7 @@ def main():
             mon.db = DbAgent(cloud, out=mon.say)              # liga sozinho quando existir db_config/<sid>
             mon.sysev = SysEvents(cloud, mon.db, out=mon.say)  # eventos do sistema: mesma conexão do DbAgent
             mon.sql = SqlEditor(cloud, mon.db, out=mon.say)    # editor SQL: pedidos pela mesma escuta do DbAgent
+            mon.prof = Profiler(cloud, mon.db, out=mon.say)    # profile do banco: idem
     # autoatualização: só o coletor; ao gravar a versão nova para a coleta e o laço abaixo sai para reiniciar
     mon.updater = Updater(os.path.abspath(__file__), ident.sync_cfg(), out=mon.say, on_restart=mon.stop_ev.set)
     mon.updater.acfg = cloud.acfg                         # intervalo e janela da autoatualização (central)
@@ -11684,6 +14148,12 @@ def main():
             print("Editor SQL remoto (só leitura): %s." % (
                 "liga junto com o acesso ao banco" if c["sql_editor"] and c["db_access"]
                 else "DESLIGADO (sync.%s)" % ("sql_editor" if not c["sql_editor"] else "db_access")))
+        if mon.prof is not None:
+            mon.prof.start()
+            c = ident.sync_cfg()
+            print("Profile do banco (pedido pela central): %s." % (
+                "disponível junto com o acesso ao banco" if c["db_profiler"] and c["db_access"]
+                else "DESLIGADO (sync.%s)" % ("db_profiler" if not c["db_profiler"] else "db_access")))
         if mon.sysev is not None:
             mon.sysev.start()
             c = ident.sync_cfg()
