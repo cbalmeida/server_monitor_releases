@@ -105,7 +105,7 @@ except ImportError:
 from array import array
 from xml.sax.saxutils import escape as xml_escape
 
-VERSION = "2.22.0"
+VERSION = "2.23.0"
 # Projeto Firebase da C2 (padrão do --firebase-setup). Não são segredos: a URL só identifica o banco e
 # a chave só identifica o projeto (restrita às APIs de login); o acesso é decidido pelas regras.
 FIREBASE_DB_URL = "https://c2-server-monitor-default-rtdb.firebaseio.com"
@@ -2776,9 +2776,10 @@ def clean_name(v):
     return " ".join(v.split())[:NAME_MAX]
 
 
-def write_private(path, text):
+def write_private(path, text, durable=False):
     """Grava atomicamente com permissão 600 (só o dono lê). O temporário tem nome imprevisível e é
-    criado com O_EXCL (mkstemp): um link simbólico plantado no diretório não é seguido."""
+    criado com O_EXCL (mkstemp): um link simbólico plantado no diretório não é seguido. durable = fsync do
+    conteúdo antes da troca (estado que não pode voltar atrás numa queda de energia, ex.: escritas já recebidas)."""
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)), prefix=".tmp-",
                                suffix="-" + os.path.basename(path))
     try:
@@ -2786,6 +2787,9 @@ def write_private(path, text):
             os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w") as f:
             f.write(text)
+            if durable:
+                f.flush()
+                os.fsync(f.fileno())
         os.replace(tmp, path)
     except BaseException:
         with contextlib.suppress(OSError):
@@ -3179,6 +3183,7 @@ SYNC_DEFAULTS = {
     "sys_events_interval": 180,  # s entre leituras da tabela de e-mails do sistema (mínimo 60)
     "sys_events_retention_days": 30,   # dias de eventos do sistema no Firebase (poda diária pelo last_at)
     "sql_editor": True,          # editor SQL remoto da central (v2.12, só leitura; exige db_access)
+    "sql_write": True,           # v2.23: escrita autorizada no editor SQL (texto assinado com a chave do catálogo)
     "service": True,             # v2.13: o coletor se registra para iniciar com o sistema (systemd/cron; tarefa no Windows)
     "db_profiler": True,         # v2.16: profile do banco pedido pela central (prof_*; exige db_access)
     "prof_keep": 20,             # sessões de profile mantidas (Firebase e cópia local)
@@ -5646,6 +5651,33 @@ class PgConn:
             raise err
         return parts, rows, tag, suspended
 
+    def script(self, sql, tags_max=1000):
+        """Texto com várias instruções numa Query só (protocolo simples; editor SQL, v2.23): uma etiqueta por
+        CommandComplete (até tags_max; as outras só contadas), DataRow descartadas e contadas, até o ReadyForQuery
+        (estado em self.tx). COPY FROM STDIN é recusado com CopyFail (não há dados para mandar); COPY TO STDOUT é
+        descartado. Devolve (etiquetas, total de etiquetas, linhas descartadas, DbError do 1º erro ou None)."""
+        self.send(_pg_msg(b"Q", _cstr(sql)))
+        return self.script_read(tags_max)
+
+    def script_read(self, tags_max=1000):
+        """Respostas de uma Query já enviada (script): ver script."""
+        tags, ntags, rows, err = [], 0, 0, None
+        while True:
+            t, p = self.read_msg()
+            if t == b"D":
+                rows += 1
+            elif t == b"C":
+                ntags += 1
+                if len(tags) < tags_max:
+                    tags.append(p.rstrip(b"\0").decode("ascii", "replace"))
+            elif t in (b"G", b"W"):                              # CopyInResponse / CopyBothResponse
+                self.send(_pg_msg(b"f", _cstr("COPY FROM STDIN não é suportado pelo editor SQL")))
+            elif t == b"E":
+                err = err or self.error(p)
+            elif t == b"Z":
+                self.tx = p[:1]
+                return tags, ntags, rows, err
+
     def cancel(self):
         """CancelRequest: conexão nova com o pid e a chave secreta do BackendKeyData (o servidor não responde)."""
         if not self.backend:
@@ -6546,6 +6578,17 @@ SQL_PRUNE_FIRST = 420              # s depois da partida até a 1ª poda (depois
 SQL_CERT_RETRY = 600               # s até tentar de novo gerar/ler o certificado
 SQL_RECENT = 500                   # execuções lembradas (estado e exec_id repetido)
 SQL_ZLIB_DEFAULT = 1
+# escrita autorizada (v2.23, docs/EDITOR_SQL.md §11): texto exato assinado (HMAC) com a chave do catálogo
+SQL_WRITE_SIG_HEAD = "c2-sql-write-v1"
+SQL_WRITE_SKEW = 300               # s: |agora - at| máximo da autorização (relógio do Firebase estimado)
+SQL_WRITE_TIMEOUT_MAX = 3600       # s: timeout_s máximo de escrita/ensaio (statement_timeout e prazo total)
+SQL_WRITE_GRACE = 5                # s além do timeout_s até o agente cancelar o texto inteiro (prazo total)
+SQL_LOCK_DEFAULT, SQL_LOCK_MAX = 10, 600     # s: lock_timeout padrão e teto (objeto travado = erro, sem fila)
+SQL_WRITES_SEEN_FILE = "sql_writes_seen.json"   # SYNC_DIR: exec_id de escrita já recebidos (anti-repetição)
+SQL_WRITES_SEEN_KEEP = 3600        # s que um exec_id de escrita fica lembrado (contrato: >= 15 min; at vale 300 s)
+SQL_WRITE_TAGS = 1000              # etiquetas no fim (as outras só contadas: tags_total)
+SQL_AUDIT_TAGS = 2000              # caracteres das etiquetas na auditoria do Firebase
+SQL_TX_WORDS = ("BEGIN", "START", "COMMIT", "END", "ROLLBACK", "ABORT", "SAVEPOINT", "RELEASE")
 SQL_ERROR_CODES = ("desligado", "expirado", "sessoes_demais", "pedido_invalido", "relay_nao_permitido",
                    "sem_certificado", "nivel_recusado", "parando", "relay_indisponivel", "relay_recusou", "sem_par",
                    "sem_hello", "nao_autorizado", "sem_banco", "canal", "interno")
@@ -7264,11 +7307,158 @@ def sql_int(v, lo, hi, default):
     return v
 
 
+def sql_ident_char(c):
+    return c.isalnum() or c in "_$" or ord(c) > 127
+
+
+def sql_statements(sql):
+    """Separa o texto em instruções do nível de cima, como o psql: fora de '...', E'...' (com \\), "...",
+    $tag$...$tag$, -- e /* */ aninhados; ';' só termina a instrução fora de parênteses e de BEGIN ATOMIC ... END
+    (corpo SQL padrão de CREATE FUNCTION/PROCEDURE, PG 14+). Devolve [(início, fim, [até 2 primeiras palavras em
+    maiúsculas])] das instruções não vazias (fim = posição do ';' ou o fim do texto)."""
+    out, n, i = [], len(sql), 0
+    start, words, paren, depth = None, [], 0, 0
+
+    def close(end):
+        if start is not None:
+            out.append((start, end, words[:2]))
+
+    while i < n:
+        c, nx = sql[i], sql[i + 1:i + 2]
+        if c == "-" and nx == "-":
+            j = sql.find("\n", i)
+            i = n if j < 0 else j + 1
+            continue
+        if c == "/" and nx == "*":
+            lvl, i = 1, i + 2
+            while i < n and lvl:
+                if sql.startswith("/*", i):
+                    lvl, i = lvl + 1, i + 2
+                elif sql.startswith("*/", i):
+                    lvl, i = lvl - 1, i + 2
+                else:
+                    i += 1
+            continue
+        if c.isspace():
+            i += 1
+            continue
+        if c == ";" and paren == 0 and depth == 0:
+            close(i)
+            start, words, i = None, [], i + 1
+            continue
+        if start is None:
+            start = i
+        if c in "'\"":
+            j = i + 1
+            while j < n:
+                if sql[j] == c:
+                    if sql[j + 1:j + 2] == c:            # '' ou "" = a própria aspa
+                        j += 2
+                        continue
+                    break
+                j += 1
+            i = j + 1
+            continue
+        if c == "$" and nx and (nx.isalpha() or nx in "_$" or ord(nx) > 127):
+            j = i + 1
+            while j < n and sql[j] != "$" and (sql[j].isalnum() or sql[j] == "_" or ord(sql[j]) > 127):
+                j += 1
+            if j < n and sql[j] == "$":                    # $tag$ ... $tag$
+                tag = sql[i:j + 1]
+                k = sql.find(tag, j + 1)
+                i = n if k < 0 else k + len(tag)
+                continue
+            i += 1
+            continue
+        if sql_ident_char(c) and c != "$":
+            j = i + 1
+            while j < n and sql_ident_char(sql[j]):
+                j += 1
+            w = sql[i:j].upper()
+            if w == "E" and sql[j:j + 1] == "'":          # E'...': \ escapa (inclusive \')
+                k = j + 1
+                while k < n:
+                    if sql[k] == "\\":
+                        k += 2
+                        continue
+                    if sql[k] == "'":
+                        if sql[k + 1:k + 2] == "'":
+                            k += 2
+                            continue
+                        break
+                    k += 1
+                i = k + 1
+                continue
+            words.append(w)
+            routine = words[0] == "CREATE" and (words[1:2] in (["FUNCTION"], ["PROCEDURE"]) or words[1:4] in (
+                ["OR", "REPLACE", "FUNCTION"], ["OR", "REPLACE", "PROCEDURE"]))
+            if routine and paren == 0:
+                if w == "ATOMIC" and len(words) > 1 and words[-2] == "BEGIN":
+                    depth += 1
+                elif w == "CASE" and depth:
+                    depth += 1
+                elif w == "END" and depth:
+                    depth -= 1
+            i = j
+            continue
+        if c == "(":
+            paren += 1
+        elif c == ")":
+            paren = max(0, paren - 1)
+        i += 1
+    close(n)
+    return out
+
+
+def sql_tx_control(sql):
+    """Controle de transação no nível de cima do texto (C2013): a palavra que o denuncia ou ''."""
+    for _, _, w in sql_statements(sql):
+        if w[:1] and w[0] in SQL_TX_WORDS:
+            return w[0]
+        if w[:2] == ["PREPARE", "TRANSACTION"]:
+            return "PREPARE TRANSACTION"
+    return ""
+
+
+def sql_stmt_index(sql, position):
+    """Instrução (1-based) que contém a posição (1-based, caracteres) informada pelo Postgres; None se não achar."""
+    try:
+        pos = int(position) - 1
+    except (TypeError, ValueError):
+        return None
+    for k, (a, b, _) in enumerate(sql_statements(sql)):
+        if a <= pos <= b:
+            return k + 1
+    return None
+
+
+def sql_write_canon(sid, exec_id, wid, at, timeout_s, lock_timeout_s, by, sql_sha256):
+    """Texto assinado da escrita (§11.3): uma linha por campo (LF), sem LF no fim; números em decimal."""
+    return "\n".join((SQL_WRITE_SIG_HEAD, sid, exec_id, wid, "%d" % at, "%d" % timeout_s, "%d" % lock_timeout_s,
+                      by, sql_sha256)).encode("utf-8")
+
+
+def sql_write_sig(key, *canon):
+    return hmac.new(key, sql_write_canon(*canon), hashlib.sha256).hexdigest()
+
+
+def sql_affected(tags):
+    """Soma dos números finais das etiquetas de INSERT/UPDATE/DELETE."""
+    n = 0
+    for t in tags:
+        p = t.split()
+        if len(p) >= 2 and p[0] in ("INSERT", "UPDATE", "DELETE") and p[-1].isdigit():
+            n += int(p[-1])
+    return n
+
+
 class SqlExec:
     def __init__(self, exec_id, d):
         self.id, self.d = exec_id, d
         self.cv = threading.Condition()
         self.credit, self.cancelled, self.pg = 0, False, None
+        self.committing = self.dropped = self.timed_out = False    # escrita: COMMIT enviado / canal caiu / prazo
+        self.posicao = self.detalhe = self.dica = None                # do ErrorResponse (escrita/ensaio)
         self.rows = self.batches = self.raw = self.sent = 0
         self.thread = None
         self.final = None                 # estado final, já valendo antes do fim/erro sair (estado_resp sem corrida)
@@ -7316,12 +7506,12 @@ class SqlSession:
         with self.mx:
             execs = list(self.execs.values())
         for e in execs:                                   # Central sumiu ou sessão encerrada: cancela no Postgres
-            self.cancel(e)
+            self.cancel(e, dropped=True)                  # (escrita com COMMIT já enviado: conclui e registra)
         if self.tcp is not None:
             self.tcp.finish(2.0)                          # erro/despedida já na fila saem; libera quem espera a fila
         for e in execs:
             if e.thread is not None:
-                e.thread.join(5)
+                e.thread.join(5 if not e.committing else 60)
         with self.mx:
             pool, self.pool = self.pool, []
         for pg in pool:
@@ -7371,11 +7561,12 @@ class SqlSession:
             return
         with self.mx:
             busy = bool(self.execs)
+            writing = any(e.d.get("modo") == "escrita" for e in self.execs.values())
         if now - self.last_rx > SQL_DEAD_S:
             self.kill("morto")
         elif not busy and now - self.last_act > SQL_IDLE_S:
             self.end("ocioso", "sessão sem uso há %d min" % (SQL_IDLE_S // 60))
-        elif now - self.t0 > SQL_SESSION_MAX:
+        elif now - self.t0 > SQL_SESSION_MAX and not writing:     # escrita em andamento termina antes (≤ 1 h)
             self.end("prazo", "duração máxima da sessão (%d h)" % (SQL_SESSION_MAX // 3600))
 
     # ---- abertura ----
@@ -7446,7 +7637,8 @@ class SqlSession:
             raise SqlClosed("sem conexão com o PostgreSQL (%s)" % e, "sem_banco")
         version = pg.server_version
         self.pg_put(pg)
-        self.send(SQL_A_HELLO_OK, {
+        key, why = self.ed.write_status()
+        self.send(SQL_A_HELLO_OK, dict({"escrita": 1} if key is not None else {"escrita_motivo": why}, **{
             "proto": min(proto, SQL_PROTO), "agente": VERSION, "sess": self.sess, "pg_version": clip(version, 128),
             "nivel": "leitura", "formatos": ["pg", "json"], "formato": self.fmt, "tls": tls.version(),
             "limites": {"consultas": SQL_MAX_EXECS, "consultas_agente": SQL_MAX_EXECS_AGENT,
@@ -7454,7 +7646,7 @@ class SqlSession:
                         "credito_max": SQL_CREDIT_MAX, "timeout_padrao_s": SQL_STMT_DEFAULT,
                         "timeout_max_s": SQL_STMT_MAX, "ping_s": SQL_PING_S, "morto_s": SQL_DEAD_S,
                         "ocioso_s": SQL_IDLE_S, "sessao_max_s": SQL_SESSION_MAX, "quadro_max": SQL_FRAME_IN_MAX,
-                        "credito_espera_s": SQL_CREDIT_WAIT}})
+                        "credito_espera_s": SQL_CREDIT_WAIT}}))
         self.tcp.deadline = None                          # aberto: daqui em diante quem decide é o vigia
         self.last_rx = self.last_act = time.monotonic()
         self.state = "aberta"
@@ -7551,12 +7743,14 @@ class SqlSession:
     # ---- execuções ----
     def start_exec(self, d):
         eid = d.get("exec_id")
+        if d.get("modo") in ("ensaio", "escrita"):
+            return self.start_write(d, d["modo"])
         if not isinstance(eid, str) or not SQL_ID_RE.match(eid):
             return self.err(eid if isinstance(eid, str) else None, "C2003",
                             "exec_id inválido (formato ^[0-9]{13}_[0-9a-z]{8}$)")
         try:
             if d.get("modo", "leitura") != "leitura":
-                raise SqlExecError("25006", "este agente só executa leitura (modo %r recusado)" % d.get("modo"))
+                raise SqlExecError("25006", "modo %r não suportado (leitura, ensaio ou escrita)" % d.get("modo"))
             sql = d.get("sql")
             if not isinstance(sql, str) or not sql.strip():
                 raise SqlExecError("C2003", "sql vazio")
@@ -7581,29 +7775,233 @@ class SqlSession:
                 raise SqlExecError("C2001", "exec_id já recebido: nada foi reexecutado")
         except SqlExecError as e:
             return self.err(eid, e.sqlstate, str(e))
+        e = self.take_slot(eid, dict(opt, sql=sql, params=params, fmt=fmt, modo="leitura"))
+        if e is None:
+            return
+        e.credit = opt["credito"]
+        self.launch(e, self.run_exec)
+
+    def take_slot(self, eid, d, **extra):
+        """Vaga para uma execução (3 por sessão, 4 no agente); sem vaga = erro 53400 e None."""
         with self.ed.mx:
             with self.mx:
                 if len(self.execs) >= SQL_MAX_EXECS or self.ed.exec_count() >= SQL_MAX_EXECS_AGENT:
-                    busy = True
+                    e = None
                 else:
-                    busy = False
-                    e = SqlExec(eid, dict(opt, sql=sql, params=params, fmt=fmt))
-                    e.credit = opt["credito"]
-                    self.execs[eid] = e
+                    e = self.execs[eid] = SqlExec(eid, d)
                     self.nexec += 1
-        if busy:
-            return self.err(eid, "53400", "execuções simultâneas demais (máximo %d por sessão, %d no agente)" % (
-                SQL_MAX_EXECS, SQL_MAX_EXECS_AGENT))
-        self.ed.remember(eid, "executando")
-        e.thread = threading.Thread(target=self.run_exec, args=(e,), name="sql-exec", daemon=True)
+        if e is None:
+            self.err(eid, "53400", "execuções simultâneas demais (máximo %d por sessão, %d no agente)" % (
+                SQL_MAX_EXECS, SQL_MAX_EXECS_AGENT), **extra)
+        return e
+
+    def launch(self, e, target):
+        self.ed.remember(e.id, "executando")
+        e.thread = threading.Thread(target=target, args=(e,), name="sql-exec", daemon=True)
         e.thread.start()
 
-    def cancel(self, e):
+    def drop_slot(self, e):
+        with self.mx:
+            self.execs.pop(e.id, None)
+
+    # ---- escrita autorizada e ensaio (v2.23, docs/EDITOR_SQL.md §11) ----
+    def start_write(self, d, modo):
+        """Valida na ordem do contrato (§11.3) antes de tocar no banco: chave/sync.sql_write (C2010), campos
+        (C2003), tamanho (54000), at (C2012), hash e assinatura (C2011), exec_id já visto (C2001), controle de
+        transação no texto (C2013). Ensaio: só chave, campos, tamanho, exec_id e controle de transação."""
+        write = modo == "escrita"
+        eid = d.get("exec_id")
+        eid_s = eid if isinstance(eid, str) and SQL_ID_RE.match(eid) else None
+        sql, wid = d.get("sql"), d.get("wid")
+        try:
+            key, why = self.ed.write_status()
+            if key is None:
+                raise SqlExecError("C2010", "escrita desligada neste servidor (sync.sql_write)" if why == "desligada"
+                                   else "sem a chave do catálogo neste servidor: escrita indisponível")
+            if eid_s is None:
+                raise SqlExecError("C2003", "exec_id inválido (formato ^[0-9]{13}_[0-9a-z]{8}$)")
+            if not isinstance(sql, str) or not sql.strip() or "\0" in sql:
+                raise SqlExecError("C2003", "sql vazio ou com caractere nulo")
+            try:
+                timeout = sql_int(d.get("timeout_s"), 1, SQL_WRITE_TIMEOUT_MAX, SQL_STMT_DEFAULT)
+                lock = sql_int(d.get("lock_timeout_s"), 1, SQL_LOCK_MAX, SQL_LOCK_DEFAULT)
+            except ValueError:
+                raise SqlExecError("C2003", "timeout_s (1-%d) ou lock_timeout_s (1-%d) fora dos limites"
+                                   % (SQL_WRITE_TIMEOUT_MAX, SQL_LOCK_MAX))
+            at, h, sig = d.get("at"), d.get("sql_sha256"), d.get("sig")
+            if write and not (isinstance(wid, str) and SQL_ID_RE.match(wid) and is_int(at) and at > 0
+                              and isinstance(h, str) and SQL_HEX64_RE.match(h)
+                              and isinstance(sig, str) and SQL_HEX64_RE.match(sig)):
+                raise SqlExecError("C2003", "autorização incompleta (wid, at, sql_sha256 e sig do contrato)")
+            if len(sql.encode("utf-8")) > SQL_SQL_MAX:
+                raise SqlExecError("54000", "sql maior que %d KB" % (SQL_SQL_MAX // 1024))
+            if write:
+                if abs(self.ed.live.server_now() * 1000 - at) > SQL_WRITE_SKEW * 1000:
+                    raise SqlExecError("C2012", "autorização vencida (mais de %d min): autorize de novo"
+                                       % (SQL_WRITE_SKEW // 60))
+                real = hashlib.sha256(sql.encode("utf-8")).hexdigest()
+                good = sql_write_sig(key, self.ed.sid, eid, wid, at, timeout, lock, self.by, h)
+                ok_h, ok_s = hmac.compare_digest(real, h), hmac.compare_digest(good, sig)
+                if not (ok_h and ok_s):
+                    raise SqlExecError("C2011", "autorização inválida (%s não confere)"
+                                       % ("hash do texto" if not ok_h else "assinatura"))
+            if self.ed.exec_known(eid) or (write and self.ed.write_seen(eid)):
+                raise SqlExecError("C2001", "exec_id já recebido: nada foi reexecutado")
+            bad = sql_tx_control(sql)
+            if bad:
+                raise SqlExecError("C2013", "retire START TRANSACTION/COMMIT do texto: o editor já executa tudo "
+                                            "numa transação (%s encontrado)" % bad)
+        except SqlExecError as x:
+            if write:
+                self.ed.audit_line({"ev": "escrita_recusada", "sess": self.sess, "by": self.by, "exec_id": eid_s,
+                                    "wid": wid if isinstance(wid, str) else None, "sqlstate": x.sqlstate,
+                                    "error": str(x)})
+            return self.err(eid_s, x.sqlstate, str(x), rollback=True)
+        o = {"modo": modo, "sql": sql, "params": [], "timeout": timeout, "lock": lock if write else None,
+             "wid": wid if write else None, "at": at if write else None}
+        e = self.take_slot(eid, o, rollback=True)
+        if e is None:
+            return
+        if write:
+            try:
+                fresh = self.ed.write_claim(eid)
+            except OSError as x:
+                self.drop_slot(e)
+                return self.err(eid, "XX000", "não foi possível registrar a autorização (%s): nada foi executado"
+                                % (x.strerror or x), rollback=True)
+            if not fresh:
+                self.drop_slot(e)
+                return self.err(eid, "C2001", "exec_id já recebido: nada foi reexecutado", rollback=True)
+        self.launch(e, self.run_write)
+
+    def run_write(self, e):
+        """Ensaio: BEGIN READ ONLY → texto (Query) → ROLLBACK sempre. Escrita: BEGIN READ WRITE com
+        statement_timeout e lock_timeout → texto → COMMIT só com o estado T; E = ROLLBACK; I = C2014. Depois
+        DISCARD ALL. Cancelado/canal caído antes do COMMIT = CancelRequest + ROLLBACK; COMMIT enviado = conclui."""
+        o = e.d
+        write = o["modo"] == "escrita"
+        t0, started = time.monotonic(), int(self.ed.live.server_now() * 1000)
+        st, sqlstate, msg, pg, timer = "erro", None, "", None, None
+        tags, ntags, discarded, committed, rollback, instr = [], 0, 0, False, True, None
+        try:
+            if write and not self.ed.audit_line({
+                    "ev": "escrita_inicio", "sess": self.sess, "by": self.by, "exec_id": e.id, "wid": o["wid"],
+                    "at_autorizado": o["at"], "timeout_s": o["timeout"], "lock_timeout_s": o["lock"],
+                    "sql_sha256": hashlib.sha256(o["sql"].encode("utf-8")).hexdigest(), "sql": o["sql"]},
+                    sync=True):
+                raise SqlExecError("XX000", "sem a auditoria local (%s): nada foi executado" % SQL_AUDIT_FILE)
+            if e.cancelled:
+                raise SqlExecError("57014", "cancelada pelo operador")
+            pg = e.pg = self.pg_get()
+            pg.sock.settimeout(o["timeout"] + 30)
+            ms = o["timeout"] * 1000
+            if write:
+                pg.simple("SET standard_conforming_strings = on; BEGIN TRANSACTION READ WRITE; "
+                          "SET LOCAL statement_timeout = %d; SET LOCAL lock_timeout = %d" % (ms, o["lock"] * 1000))
+            else:                                         # ensaio: só leitura mesmo se o texto fechar a transação
+                pg.simple("SET standard_conforming_strings = on; SET default_transaction_read_only = on; "
+                          "BEGIN TRANSACTION READ ONLY; SET LOCAL statement_timeout = %d" % ms)
+            timer = threading.Timer(o["timeout"] + SQL_WRITE_GRACE, self.expire, args=(e,))
+            timer.daemon = True
+            timer.start()
+            with e.cv:
+                if e.cancelled:
+                    raise SqlExecError("57014", "cancelada pelo operador")
+            pg.send(_pg_msg(b"Q", _cstr(o["sql"])))
+            with contextlib.suppress(SqlClosed):
+                self.send(SQL_A_ACEITO, {"exec_id": e.id})
+            tags, ntags, discarded, err = pg.script_read(SQL_WRITE_TAGS)
+            if err is not None:
+                instr = sql_stmt_index(o["sql"], err.position) or ntags + 1
+                raise err
+            if pg.tx == b"I":
+                rollback = False
+                raise SqlExecError("C2014", "o texto encerrou a transação (COMMIT/ROLLBACK escondido): o que ele "
+                                            "confirmou não pode ser desfeito")
+            if pg.tx != b"T":
+                raise SqlExecError("XX000", "estado inesperado da transação depois do texto (%r)" % pg.tx)
+            if write:
+                with e.cv:
+                    if e.cancelled:
+                        raise SqlExecError("57014", "cancelada pelo operador")
+                    e.committing = True                   # daqui em diante nem cancelar nem canal caído desfazem
+                try:
+                    pg.simple("COMMIT")
+                except DbError as x:
+                    rollback = bool(x.sqlstate)           # o servidor respondeu: desfez; sem resposta = incerto
+                    raise
+                committed = True
+            st = e.final = "concluida"
+            doc = {"exec_id": e.id, "modo": o["modo"], "tags": tags, "linhas_afetadas": sql_affected(tags),
+                   "linhas_descartadas": discarded, "commit": committed, "ms": round((time.monotonic() - t0) * 1000, 1)}
+            if ntags > len(tags):
+                doc["tags_total"] = ntags
+            with contextlib.suppress(SqlClosed):
+                self.send(SQL_A_FIM, doc)
+        except SqlExecError as x:
+            st, sqlstate, msg = "cancelada" if x.sqlstate == "57014" else "erro", x.sqlstate, str(x)
+            if x.sqlstate == "57014" and e.timed_out:
+                st, msg = "erro", "tempo esgotado (timeout_s = %d s)" % o["timeout"]
+        except DbError as x:
+            sqlstate = x.sqlstate or {"conexao": "08006", "tempo_esgotado": "57014", "autenticacao": "28000",
+                                      "resposta_grande": "54000"}.get(x.code, "XX000")
+            st = "cancelada" if e.cancelled and not e.timed_out and not e.committing else "erro"
+            msg = x.pgmsg or str(x)
+            if e.timed_out and not e.committing:
+                msg = "tempo esgotado (timeout_s = %d s)" % o["timeout"]
+            if e.committing and not x.sqlstate:
+                msg = "o PostgreSQL não confirmou o COMMIT (%s): resultado incerto, confira no banco" % msg
+            e.posicao, e.detalhe, e.dica = x.position, x.detail, x.hint
+        except Exception as x:                            # defeito inesperado: a execução termina, a sessão segue
+            st, sqlstate, msg = "erro", "XX000", "erro interno do agente: %s" % type(x).__name__
+        finally:
+            if timer is not None:
+                timer.cancel()
+            e.pg = None
+            if pg is not None:                            # desfaz antes de avisar: o erro diz o que ficou
+                try:
+                    if pg.tx != b"I":
+                        pg.simple("ROLLBACK")
+                    pg.simple("DISCARD ALL")
+                    pg.sock.settimeout(pg.timeout)
+                    if e.cancelled or e.timed_out:
+                        pg.close()                        # um CancelRequest atrasado não pode pegar outra execução
+                    else:
+                        self.pg_put(pg)
+                except (DbError, OSError):
+                    pg.close()
+            if st != "concluida":
+                if e.dropped and st == "cancelada":
+                    st = "interrompida"
+                e.final = st
+                if not e.dropped:
+                    self.err(e.id, sqlstate or "XX000", msg, rollback=rollback, instrucao=instr, posicao=e.posicao,
+                             detalhe=e.detalhe, dica=e.dica, cancelada=True if st == "cancelada" else None)
+            self.drop_slot(e)
+            self.last_act = time.monotonic()
+            self.ed.remember(e.id, st)
+            self.ed.audit_exec(self, e, st, started, round((time.monotonic() - t0) * 1000, 1), sqlstate, msg,
+                               False, extra={"tags": tags, "tags_total": ntags, "commit": committed,
+                                             "linhas_afetadas": sql_affected(tags), "linhas_descartadas": discarded})
+
+    def expire(self, e):
+        """Prazo total da escrita/ensaio (timeout_s + SQL_WRITE_GRACE), além do statement_timeout de cada instrução."""
         with e.cv:
-            e.cancelled = True
-            e.cv.notify_all()
+            if e.committing or e.final:
+                return
+            e.timed_out = True
         pg = e.pg
         if pg is not None:
+            pg.cancel()
+
+    def cancel(self, e, dropped=False):
+        with e.cv:
+            e.cancelled = True
+            e.dropped = e.dropped or dropped
+            committing = e.committing
+            e.cv.notify_all()
+        pg = e.pg
+        if pg is not None and not committing:
             pg.cancel()
 
     def pg_get(self):
@@ -7716,7 +8114,7 @@ class SqlSession:
 
 
 class SqlEditor:
-    """Editor SQL remoto (v2.12, só leitura). Thread 'sql' (controle): recebe os pedidos de sessão que a escuta do
+    """Editor SQL remoto (v2.12, leitura; v2.23, escrita autorizada e ensaio, §11). Thread 'sql' (controle): recebe os pedidos de sessão que a escuta do
     DbAgent entrega (db_requests/{sid}/sql), valida e recusa ou abre a sessão (thread própria), responde em
     sql_responses/{sid}/{sess}, mantém o certificado e info/{sid}/sql_cert_fp, vigia as sessões (canal mudo,
     ociosidade, duração), envia a auditoria (sql_audit, sem linhas de resultado) e poda uma vez por dia.
@@ -7744,6 +8142,9 @@ class SqlEditor:
         self.audit_next = 0.0
         self.next_prune = time.time() + SQL_PRUNE_FIRST
         self.stats = {"sessoes": 0, "recusadas": 0, "execucoes": 0}
+        self.wseen_path = os.path.join(cloud.dir, SQL_WRITES_SEEN_FILE)
+        self.wseen = None                    # exec_id de escrita -> instante (lido do disco na 1ª escrita)
+        self.wlock = threading.Lock()
         db.sql = self
 
     def say(self, msg):
@@ -7969,8 +8370,47 @@ class SqlEditor:
         with self.mx:
             return self.recent.get(eid, "desconhecida")
 
+    # ---- escrita autorizada (v2.23): chave, interruptor e anti-repetição persistente ----
+    def write_status(self):
+        """(chave do catálogo, '') se a escrita está disponível; senão (None, 'desligada' | 'sem_chave')."""
+        if not self.ident.sync_cfg()["sql_write"]:
+            return None, "desligada"
+        key = read_catkey(self.db.key_path)
+        return (key, "") if key is not None else (None, "sem_chave")
+
+    def write_load(self):
+        """Chamar com self.wlock. Arquivo ilegível = vazio (a janela de 300 s do at limita a repetição)."""
+        if self.wseen is None:
+            try:
+                d = json.loads(read_file(self.wseen_path) or "{}").get("seen") or {}
+                self.wseen = {k: float(v) for k, v in d.items() if isinstance(k, str) and is_num(v)}
+            except (ValueError, AttributeError, TypeError):
+                self.wseen = {}
+        now = time.time()
+        for k in [k for k, t in self.wseen.items() if now - t >= SQL_WRITES_SEEN_KEEP]:
+            del self.wseen[k]
+        return self.wseen
+
+    def write_seen(self, eid):
+        with self.wlock:
+            return eid in self.write_load()
+
+    def write_claim(self, eid):
+        """Registra o exec_id (fsync) antes de executar; False se já estava lá. OSError = não registrou."""
+        with self.wlock:
+            seen = self.write_load()
+            if eid in seen:
+                return False
+            new = dict(seen)
+            new[eid] = time.time()
+            os.makedirs(os.path.dirname(self.wseen_path), mode=0o700, exist_ok=True)
+            write_private(self.wseen_path, json.dumps({"seen": new}, separators=(",", ":")), durable=True)
+            self.wseen = new
+            return True
+
     # ---- auditoria ----
-    def audit_line(self, doc):
+    def audit_line(self, doc, sync=False):
+        """Uma linha JSON no arquivo local (600). sync = fsync antes de voltar (escrita). False = não gravou."""
         line = json.dumps(dict({"at": iso_now()}, **doc), ensure_ascii=False)
         try:
             fd = os.open(self.audit_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600)
@@ -7978,15 +8418,18 @@ class SqlEditor:
                 if hasattr(os, "fchmod"):
                     os.fchmod(fd, 0o600)
                 os.write(fd, (line + "\n").encode("utf-8"))
+                if sync:
+                    os.fsync(fd)
             finally:
                 os.close(fd)
         except OSError:
-            pass
+            return False
+        return True
 
-    def audit_exec(self, s, e, st, started, ms, sqlstate, msg, truncated):
-        sql = e.d["sql"]
+    def audit_exec(self, s, e, st, started, ms, sqlstate, msg, truncated, extra=None):
+        sql, modo = e.d["sql"], e.d.get("modo", "leitura")
         self.stats["execucoes"] += 1
-        doc = {"sess": s.sess, "by": clip(s.by, 128), "nivel": "leitura", "sql": clip(sql, SQL_AUDIT_SQL),
+        doc = {"sess": s.sess, "by": clip(s.by, 128), "nivel": modo, "sql": clip(sql, SQL_AUDIT_SQL),
                "sql_sha256": hashlib.sha256(sql.encode("utf-8")).hexdigest(), "sql_len": len(sql),
                "started_at": started, "state": st, "rows": e.rows, "bytes": e.raw, "ms": ms}
         if sqlstate and re.match(r"^[0-9A-Z]{5}$", sqlstate):
@@ -7995,7 +8438,14 @@ class SqlEditor:
             doc["error"] = clip(msg, 500)
         if truncated:
             doc["truncada"] = True
-        self.audit_line(dict(doc, ev="execucao", exec_id=e.id, sql=sql, params_n=len(e.d["params"])))
+        local = {}
+        if extra is not None:                             # ensaio/escrita (v2.23)
+            doc["tags"] = clip("; ".join(extra["tags"]), SQL_AUDIT_TAGS)
+            local = dict(extra)
+            if modo == "escrita":
+                doc.update(wid=e.d["wid"], commit=extra["commit"])
+        self.audit_line(dict(doc, ev="execucao", exec_id=e.id, sql=sql, params_n=len(e.d["params"]), **local),
+                        sync=modo == "escrita")
         with self.mx:
             self.audits.append((e.id, doc))
             while len(self.audits) > SQL_AUDIT_QUEUE:
@@ -15402,9 +15852,11 @@ def run_sql_diagnostics(ident, cfg, ac, out=print):
             fp = hashlib.sha256(ssl.PEM_cert_to_DER_cert(f.read())).hexdigest()
     except (OSError, ValueError, AttributeError):
         pass
-    out("SQL (editor remoto, só leitura): %s | openssl: %s | certificado: %s" % (
+    write = ("DESLIGADA (sync.sql_write)" if not cfg.get("sql_write", True) else "autorizada pela central"
+             if read_catkey(os.path.join(ident.base, CATKEY_FILE)) is not None else "sem a chave do catálogo")
+    out("SQL (editor remoto): %s | escrita: %s | openssl: %s | certificado: %s" % (
         "ligado" if on else "DESLIGADO (sync.%s)" % ("sql_editor" if not cfg["sql_editor"] else "db_access"),
-        shutil.which("openssl") or "ausente (gerador próprio em Python)", fp))
+        write, shutil.which("openssl") or "ausente (gerador próprio em Python)", fp))
     relays = sql_relays_parse(ac.get("sql", "relays")) or sql_relays_parse(SQL_RELAYS_DEFAULT)
     for r in relays:
         out("  relay %s: %s" % (r, sql_probe(r)))
@@ -15736,7 +16188,7 @@ def main():
         if mon.sql is not None:
             mon.sql.start()
             c = ident.sync_cfg()
-            print("Editor SQL remoto (só leitura): %s." % (
+            print("Editor SQL remoto (leitura; escrita só autorizada, sync.sql_write): %s." % (
                 "liga junto com o acesso ao banco" if c["sql_editor"] and c["db_access"]
                 else "DESLIGADO (sync.%s)" % ("sql_editor" if not c["sql_editor"] else "db_access")))
         if mon.prof is not None:
