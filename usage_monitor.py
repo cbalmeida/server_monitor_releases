@@ -55,6 +55,7 @@ import getpass
 import glob
 import gzip
 import hashlib
+import heapq
 import hmac
 import html
 import http.client
@@ -66,8 +67,10 @@ try:
     import msvcrt                  # só Windows: trava de arquivo e leitura de segredo com eco '*'
 except ImportError:
     msvcrt = None
+import ntpath
 import os
 import platform
+import posixpath
 import queue
 import random
 import re
@@ -102,7 +105,7 @@ except ImportError:
 from array import array
 from xml.sax.saxutils import escape as xml_escape
 
-VERSION = "2.20.0"
+VERSION = "2.22.0"
 # Projeto Firebase da C2 (padrão do --firebase-setup). Não são segredos: a URL só identifica o banco e
 # a chave só identifica o projeto (restrita às APIs de login); o acesso é decidido pelas regras.
 FIREBASE_DB_URL = "https://c2-server-monitor-default-rtdb.firebaseio.com"
@@ -6104,10 +6107,14 @@ class DbAgent:
         if self.files is not None:                        # arquivos (v2.19): db_requests/{sid}/file
             inbox = self.pending.get(FILE_INBOX)
             self.files.inbox(dict(inbox) if isinstance(inbox, dict) else {})
+            inbox = self.pending.get(PULL_INBOX)          # v2.22: trazer arquivo (db_requests/{sid}/pull)
+            self.files.inbox_pull(dict(inbox) if isinstance(inbox, dict) else {})
+            inbox = self.pending.get(FS_INBOX)            # v2.22: listar pasta (db_requests/{sid}/fs)
+            self.files.inbox_fs(dict(inbox) if isinstance(inbox, dict) else {})
         for rid in sorted(self.pending):
             if self.stop_ev.is_set():
                 break
-            if rid not in self.done and rid not in (SQL_INBOX, PROF_INBOX, FILE_INBOX):
+            if rid not in self.done and rid not in (SQL_INBOX, PROF_INBOX, FILE_INBOX, PULL_INBOX, FS_INBOX):
                 self.handle(rid, self.pending[rid])
 
     def answer(self, rid, op_id, params, at):
@@ -11049,7 +11056,7 @@ def ask_catkey(ident, live=None, force=False):
 # --------------------------------------------------------------------------
 FILE_INBOX = "file"                # db_requests/{sid}/file/{fid}: pedidos da central (mesma escuta do DbAgent)
 FILE_STATE = "files.json"          # SYNC_DIR/files.json: downloads aceitos (retomada após reinício) e concluídos
-FILE_DIR = "recebidos"             # <pasta do agente>/recebidos/<AAAAMMDD-HHMMSS>_<nome>
+FILE_DIR = "recebidos"             # <pasta do agente>/recebidos/<nome> (v2.21: nome original, sobrescreve)
 FILE_PART_DIR = ".parcial"         # recebidos/.parcial/<fid>.part: download em andamento
 FILE_MAX = 200 * 1024 * 1024       # bytes por arquivo
 FILE_VALID_MAX = 31 * 86400 * 1000 # ms: validade máxima de um pedido (30 dias + folga de relógio)
@@ -11138,13 +11145,147 @@ def file_opener():
     return urllib.request.build_opener(urllib.request.HTTPSHandler(context=sql_relay_ctx()))
 
 
+# --------------------------------------------------------------------------
+# Receber arquivos dos servidores na central (v2.22, contrato em docs/RECEBER_ARQUIVOS.md): a central navega nas
+# pastas do servidor (listagem assinada, só leitura) e pede um arquivo; o agente sobe para o depósito do relay com um
+# token de uso único (Authorization: C2Up) e a central baixa de lá. Segredos ficam bloqueados (fs_blocked).
+# --------------------------------------------------------------------------
+FS_INBOX = "fs"                    # db_requests/{sid}/fs/{rid}: listar uma pasta
+PULL_INBOX = "pull"                # db_requests/{sid}/pull/{fid}: trazer um arquivo
+FS_STATE = "fs_listings.json"      # SYNC_DIR/fs_listings.json: listagens gravadas (poda; só da thread de listagem)
+FS_RID_RE = re.compile(r"^[A-Za-z0-9_-]{16,40}$")
+FS_PATH_MAX = 1000
+FS_MAX_ENTRIES = 2000
+FS_EXPIRE = 600                    # s: pedido de listagem mais velho que isso = expirado
+FS_KEEP = 3600                     # s: listagens gravadas há mais tempo são apagadas pelo agente
+FS_PRUNE_EVERY = 600               # s entre verificações da poda das listagens
+FS_FIELDS = ("op", "path", "ts", "sig")
+PULL_FIELDS = ("path", "url", "token", "expires_at", "ts", "sig")
+PULL_CHUNK = 8 * 1024 * 1024       # bytes por PUT no depósito
+PULL_READ = 1 << 20                # bytes por leitura do arquivo (SHA-256 em streaming)
+PULL_REFUSE = {"pedido_invalido", "url_nao_permitida", "sem_chave", "assinatura", "expirado", "bloqueado", "vazio",
+               "tamanho", "nao_e_arquivo"}   # recusas (antes de ler); o resto = erro
+FS_SECRET_DIRS = (".ssh", ".aws", ".gnupg")
+FS_SECRET_NAMES = (".pgpass", ".netrc", ".git-credentials", "pgpass.conf")
+FS_SECRET_KEYS = ("id_rsa", "id_dsa", "id_ecdsa", "id_ed25519")
+FS_LINUX_TREES = ("/proc", "/sys", "/dev", "/run/secrets")
+FS_LINUX_PREFIX = ("/etc/shadow", "/etc/gshadow", "/etc/sudoers")
+FS_WIN_TREES = ("\\windows\\system32\\config", "\\windows\\repair")
+
+
+def fs_sig(key, sid, rid, path, ts):
+    """Assinatura do pedido de listagem (c2-fs-v1)."""
+    text = "\n".join(("c2-fs-v1", sid, rid, "listar", path, str(ts)))
+    return hmac.new(key, text.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def pull_sig(key, sid, fid, d):
+    """Assinatura do pedido de arquivo (c2-pull-v1): servidor, arquivo, caminho, depósito e validade."""
+    text = "\n".join(("c2-pull-v1", sid, fid, d["path"], d["url"], str(d["expires_at"]), str(d["ts"])))
+    return hmac.new(key, text.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def fs_path_ok(path, windows=None):
+    """Caminho absoluto deste sistema (Linux /..., Windows X:\\...; UNC proibido), sem '..' como componente."""
+    windows = IS_WINDOWS if windows is None else windows
+    if not isinstance(path, str) or not 1 <= len(path) <= FS_PATH_MAX or "\x00" in path:
+        return False
+    if windows:
+        if not re.match(r"^[A-Za-z]:\\", path) or "/" in path:
+            return False
+        parts = path[3:].split("\\")
+    else:
+        if not path.startswith("/"):
+            return False
+        parts = path[1:].split("/")
+    return ".." not in parts
+
+
+def fs_blocked(path, agent=(), sync_dir=None, inbox=None, windows=None):
+    """Caminho (absoluto, já com os links resolvidos) que a central não pode listar nem trazer (RECEBER_ARQUIVOS.md
+    §5): segredos do agente (tokens, chave do catálogo, chave do editor SQL, SYNC_DIR), do sistema e de usuários.
+    No Windows a comparação não diferencia maiúsculas. Na dúvida bloqueia (nomes comparados em minúsculas)."""
+    windows = IS_WINDOWS if windows is None else windows
+    pm = ntpath if windows else posixpath
+
+    def norm(p):
+        return pm.normcase(pm.normpath(p))
+
+    def under(p, d):
+        d = norm(d)
+        return p == d or p.startswith(d.rstrip(pm.sep) + pm.sep)
+    p = norm(path)
+    if any(p == norm(a) for a in agent) or (sync_dir and under(p, sync_dir)):
+        return True
+    low = [x.lower() for x in p.split(pm.sep) if x]
+    base = low[-1] if low else ""
+    if any(x in FS_SECRET_DIRS for x in low) or base in FS_SECRET_NAMES:
+        return True
+    if windows:
+        rest = p[2:] if len(p) >= 2 and p[1] == ":" else p
+        if any(rest == d or rest.startswith(d + "\\") for d in FS_WIN_TREES) or base.startswith("ntuser.dat"):
+            return True
+    else:
+        if any(under(p, d) for d in FS_LINUX_TREES) or p.startswith(FS_LINUX_PREFIX):
+            return True
+        if posixpath.dirname(p) == "/etc/ssh" and base.endswith("_key"):
+            return True
+    if base.startswith(FS_SECRET_KEYS) and not base.endswith(".pub"):
+        return True
+    return base.endswith((".key", ".pem")) and not (inbox and under(p, inbox))
+
+
+def fs_name(name):
+    """Nome para o Firebase: bytes que não são UTF-8 (Linux) viram U+FFFD; até 255 caracteres."""
+    with contextlib.suppress(UnicodeError):
+        name = name.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+    return clip(name, 255)
+
+
+def win_roots():
+    """Unidades fixas do Windows (C:\\, D:\\...), como em WindowsSource.filesystems; sem as APIs, as letras que
+    existem."""
+    k32 = getattr(source(), "k32", None)
+    if k32 is not None and ctypes is not None:
+        buf = ctypes.create_unicode_buffer(1024)
+        n = k32.GetLogicalDriveStringsW(len(buf), buf)
+        if 0 < n <= len(buf):
+            return sorted(r for r in buf[:n].split("\0") if r and k32.GetDriveTypeW(r) == DRIVE_FIXED)
+    return [c + ":\\" for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ" if os.path.isdir(c + ":\\")]
+
+
+class PullBody:
+    """Corpo de um PUT (até `n` bytes do arquivo a partir da posição atual): soma no SHA-256 e respeita o limite de
+    banda enquanto o http.client lê. Parada do agente = interrompe o envio."""
+
+    def __init__(self, f, n, h, owner):
+        self.f, self.left, self.h, self.owner, self.count, self.short = f, n, h, owner, 0, False
+
+    def read(self, size=-1):
+        if self.left <= 0:
+            return b""
+        size = self.left if size is None or size < 0 else min(size, self.left)
+        b = self.f.read(size)
+        if not b:                                       # o arquivo encolheu no meio do envio
+            self.short = True
+            raise OSError("o arquivo diminuiu durante o envio")
+        self.left -= len(b)
+        self.count += len(b)
+        self.h.update(b)
+        self.owner.throttle(len(b))
+        return b
+
+
 class FileReceiver:
     """Thread 'arquivos' (v2.19, docs/ENVIO_ARQUIVOS.md). Pedidos em db_requests/{sid}/file/{fid}: entregues pela escuta
     do DbAgent quando ela está ativa; sem ela (db_access desligado, escuta caída) lê o nó a cada FILE_POLL e quando a
     central avisa (signals/{sid}/file_at). Confere formato, URL (só relays permitidos), validade, tamanho, destino e a
     assinatura (chave do catálogo) ANTES de baixar; um download por vez, com Range para retomar, limite de banda
     (agent_config files.max_kbps), espera crescente nas falhas até expirar. Estado em SYNC_DIR/files.json (atômico):
-    aceitos (retomados na partida) e concluídos (o resultado é reenviado até o Firebase confirmar)."""
+    aceitos (retomados na partida) e concluídos (o resultado é reenviado até o Firebase confirmar).
+    v2.22 (docs/RECEBER_ARQUIVOS.md): também lista pastas (db_requests/{sid}/fs, thread própria 'arquivos-lista',
+    para responder em segundos mesmo com um download/subida de 200 MB em andamento) e sobe arquivos pedidos pela
+    central (db_requests/{sid}/pull, na mesma fila serial dos downloads: uma transferência por vez)."""
 
     def __init__(self, cloud, db=None, out=None):
         self.cloud, self.db, self.live, self.ident, self.out = cloud, db, cloud.live, cloud.ident, out
@@ -11160,6 +11301,23 @@ class FileReceiver:
         self.poll_next = 0.0
         self.retry = {}                   # fid -> (falhas, próxima tentativa)
         self.flush_next = 0.0
+        self.pull_box = None              # espelho de db_requests/{sid}/pull
+        self.pull_retry = {}              # fid -> (falhas, próxima tentativa) das subidas
+        self.tx = None                    # (início, bytes, limite B/s) da subida em andamento
+        # listagens (thread 'arquivos-lista'): estado só dela
+        self.fs_ev = threading.Event()
+        self.fs_thread = None
+        self.fs_box = None                # espelho de db_requests/{sid}/fs
+        self.fs_poll_next = 0.0
+        self.fs_prune_next = 0.0
+        self.fs_done = {}                 # rid -> momento: respondido (não repete enquanto o pedido existir)
+        self.fs_unsent = {}               # rid -> doc: resposta que o Firebase ainda não confirmou
+        self.fs_path = os.path.join(cloud.dir, FS_STATE)
+        self.fs_st = self.fs_load()
+        self.agent_secrets = []
+        for n in (TOKEN_FILE, LIVE_FILE, CATKEY_FILE, SQL_KEY_FILE):
+            p = os.path.join(cloud.base, n)
+            self.agent_secrets += [p, os.path.realpath(p)]
         self.st = self.load()
         if db is not None:
             db.files = self
@@ -11173,7 +11331,7 @@ class FileReceiver:
         d = read_json(self.path)
         d = d if isinstance(d, dict) else {}
         st = {"cleaned_at": d["cleaned_at"] if is_num(d.get("cleaned_at")) else 0}
-        for k in ("jobs", "done"):
+        for k in ("jobs", "done", "pulls", "pulled"):
             v = d.get(k)
             st[k] = {f: x for f, x in v.items() if FILE_ID_RE.match(f) and isinstance(x, dict)} if isinstance(v, dict) else {}
         return st
@@ -11186,12 +11344,16 @@ class FileReceiver:
     def start(self):
         self.thread = threading.Thread(target=self.loop, name="arquivos", daemon=True)
         self.thread.start()
+        self.fs_thread = threading.Thread(target=self.fs_loop, name="arquivos-lista", daemon=True)
+        self.fs_thread.start()
 
     def stop(self):
         self.stop_ev.set()
         self.wake_ev.set()
-        if self.thread is not None and self.thread is not threading.current_thread():
-            self.thread.join(10)
+        self.fs_ev.set()
+        for t in (self.thread, self.fs_thread):
+            if t is not None and t is not threading.current_thread():
+                t.join(10)
 
     def inbox(self, box):
         """Chamado pela thread 'banco' com o filho db_requests/{sid}/file inteiro (espelho da escuta)."""
@@ -11199,10 +11361,23 @@ class FileReceiver:
             self.box = dict(box)
         self.wake_ev.set()
 
+    def inbox_pull(self, box):
+        """Thread 'banco': filho db_requests/{sid}/pull inteiro (v2.22)."""
+        with self.mx:
+            self.pull_box = dict(box)
+        self.wake_ev.set()
+
+    def inbox_fs(self, box):
+        """Thread 'banco': filho db_requests/{sid}/fs inteiro (v2.22); atendido pela thread 'arquivos-lista'."""
+        with self.mx:
+            self.fs_box = dict(box)
+        self.fs_ev.set()
+
     def wake(self):
         """Aviso da central (signals/{sid}/file_at): lê os pedidos já."""
-        self.poll_next = 0.0
+        self.poll_next = self.fs_poll_next = 0.0
         self.wake_ev.set()
+        self.fs_ev.set()
 
     def loop(self):
         while not self.stop_ev.is_set():
@@ -11229,8 +11404,11 @@ class FileReceiver:
             self.poll()
         with self.mx:
             box, self.box = self.box, None
+            pbox, self.pull_box = self.pull_box, None
         if box is not None:
             self.take(box)
+        if pbox is not None:
+            self.take_pull(pbox)
         if now >= self.flush_next:
             self.flush()
         wait = self.work()
@@ -11244,11 +11422,13 @@ class FileReceiver:
         self.poll_next = time.time() + FILE_POLL
         try:
             d = self.live.get("db_requests/%s/%s" % (self.sid, FILE_INBOX))
+            p = self.live.get("db_requests/%s/%s" % (self.sid, PULL_INBOX))
         except CloudError:
             self.poll_next = time.time() + FILE_RETRY
             return
         with self.mx:
             self.box = d if isinstance(d, dict) else {}
+            self.pull_box = p if isinstance(p, dict) else {}
 
     # ---- pedidos ----
     def take(self, box):
@@ -11368,19 +11548,28 @@ class FileReceiver:
     def flush(self):
         for fid in sorted(self.st["done"]):
             if not self.flush_one(fid):
-                break
+                return
+        for fid in sorted(self.st["pulled"]):
+            if not self.pull_flush_one(fid):
+                return
 
     # ---- download ----
     def work(self):
-        jobs = sorted(self.st["jobs"].items(), key=lambda x: (x[1].get("accepted_at", 0), x[0]))
+        """Fila serial: downloads (file) e subidas (pull, v2.22) na ordem em que foram aceitos; um por vez."""
+        jobs = sorted([(j.get("accepted_at", 0), fid, "file", j) for fid, j in self.st["jobs"].items()] +
+                      [(j.get("accepted_at", 0), fid, "pull", j) for fid, j in self.st["pulls"].items()],
+                      key=lambda x: x[:3])
         if not jobs:
             return 60
         now, wait = time.time(), 60.0
-        for fid, job in jobs:
-            fails, at = self.retry.get(fid, (0, 0.0))
+        for _, fid, kind, job in jobs:
+            fails, at = (self.retry if kind == "file" else self.pull_retry).get(fid, (0, 0.0))
             if at > now:
                 wait = min(wait, at - now)
                 continue
+            if kind == "pull":
+                self.pull_run(fid, job, fails)
+                return 0.2
             try:
                 self.download(fid, job)
             except FileError as e:
@@ -11511,41 +11700,23 @@ class FileReceiver:
         return have, h
 
     def store(self, fid, job, part):
-        """Grava o arquivo baixado. Sem subpasta: recebidos/<AAAAMMDD-HHMMSS>_<nome> (nunca sobrescreve). Com subpasta
-        (v2.20): recebidos/<subpasta>/<nome original>; já existe = só com `overwrite`, guardando o anterior como
-        .bak-<data> ao lado. Devolve (caminho gravado, cópia de segurança ou None)."""
-        stamp = time.strftime("%Y%m%d-%H%M%S")
+        """Grava o arquivo baixado em recebidos/<nome original> ou, com subpasta (v2.20), recebidos/<subpasta>/<nome>.
+        Já existe = sobrescreve, sem perguntar e sem .bak (v2.21, decisão do usuário: recebidos é a caixa de entrada;
+        mandar de novo o mesmo nome = versão nova; até a v2.20 o nome ganhava a data na frente). `overwrite` vale só
+        para o dest_path. Devolve (caminho gravado, None)."""
         sub = job.get("subdir")
-        if not sub:
-            dst = os.path.join(self.dir, "%s_%s" % (stamp, job["name"]))
-            if os.path.lexists(dst):
-                dst = os.path.join(self.dir, "%s_%s_%s" % (stamp, fid[:8], job["name"]))
-            try:
-                os.replace(part, dst)
-            except OSError as e:
-                raise FileError("gravacao", "não consegui gravar em %s (%s)" % (dst, e))
-            return dst, None
-        folder = os.path.join(self.dir, *sub.split("/"))
+        folder = os.path.join(self.dir, *sub.split("/")) if sub else self.dir
         dst = os.path.join(folder, job["name"])
-        backup = None
         try:
             os.makedirs(folder, exist_ok=True)
-            if os.path.lexists(dst):
-                if os.path.isdir(dst):
-                    raise FileError("destino_invalido", "já existe uma pasta com o nome do arquivo: %s" % dst)
-                if not job["overwrite"]:
-                    raise FileError("destino_existe", "já existe %s e o envio não permite sobrescrever" % dst)
-                backup = "%s.bak-%s" % (dst, stamp)
-                shutil.copy2(dst, backup)
+            if os.path.isdir(dst):
+                raise FileError("destino_invalido", "já existe uma pasta com o nome do arquivo: %s" % dst)
             os.replace(part, dst)
         except OSError as e:
-            if backup:
-                with contextlib.suppress(OSError):
-                    os.remove(backup)
             if IS_WINDOWS and (isinstance(e, PermissionError) or getattr(e, "winerror", None) in (5, 32, 33)):
                 raise FileError("arquivo_em_uso", "o arquivo está em uso (feche o programa e envie de novo): %s" % dst)
             raise FileError("gravacao", "não consegui gravar em %s (%s)" % (dst, e))
-        return dst, backup
+        return dst, None
 
     def install(self, fid, saved, job):
         """Copia para dest_path: troca atômica (temporário na mesma pasta + os.replace), com .bak do anterior."""
@@ -11603,10 +11774,479 @@ class FileReceiver:
                 if fid not in self.st["jobs"] and e.stat(follow_symlinks=False).st_mtime < now - FILE_PART_STALE:
                     with contextlib.suppress(OSError):
                         os.remove(e.path)
-        for fid in [f for f, d in self.st["done"].items()
-                    if "doc" not in d and not (is_num(d.get("at")) and d["at"] > now - FILE_DONE_KEEP)]:
-            del self.st["done"][fid]
+        for k in ("done", "pulled"):
+            for fid in [f for f, d in self.st[k].items()
+                        if "doc" not in d and not (is_num(d.get("at")) and d["at"] > now - FILE_DONE_KEEP)]:
+                del self.st[k][fid]
         self.save()
+
+    # ---- bloqueados (v2.22) ----
+    def blocked(self, path):
+        return fs_blocked(path, self.agent_secrets, os.path.realpath(self.cloud.dir), os.path.realpath(self.dir))
+
+    def blocked_any(self, path):
+        """Bloqueado pelo caminho pedido (normalizado) ou pelo destino real (links resolvidos)."""
+        return self.blocked(os.path.normpath(path)) or self.blocked(os.path.realpath(path))
+
+    # ---- listagens (v2.22, thread 'arquivos-lista') ----
+    def fs_load(self):
+        d = read_json(self.fs_path)
+        v = d.get("listings") if isinstance(d, dict) else None
+        return {"listings": {r: t for r, t in v.items() if FS_RID_RE.match(r) and is_num(t)} if isinstance(v, dict)
+                else {}}
+
+    def fs_save(self):
+        os.makedirs(self.cloud.dir, mode=0o700, exist_ok=True)
+        write_private(self.fs_path, json.dumps(self.fs_st, separators=(",", ":")))
+
+    def fs_loop(self):
+        while not self.stop_ev.is_set():
+            try:
+                wait = self.fs_step()
+            except Exception as e:                        # nunca derruba a thread
+                self.say("Arquivos: erro interno na listagem (%s: %s)" % (type(e).__name__, e))
+                wait = 30
+            self.fs_ev.wait(max(0.2, min(wait, 60)))
+            self.fs_ev.clear()
+
+    def fs_step(self):
+        """Uma volta da listagem: pedidos novos (escuta do DbAgent ou leitura), respostas não confirmadas, poda."""
+        if not self.enabled():
+            return 60
+        now = time.time()
+        if not self.listening() and now >= self.fs_poll_next:
+            self.fs_poll_next = now + FILE_POLL
+            try:
+                d = self.live.get("db_requests/%s/%s" % (self.sid, FS_INBOX))
+            except CloudError:
+                self.fs_poll_next = now + FILE_RETRY
+            else:
+                with self.mx:
+                    self.fs_box = d if isinstance(d, dict) else {}
+        with self.mx:
+            box, self.fs_box = self.fs_box, None
+        if box is not None:
+            self.fs_take(box)
+        for rid in sorted(self.fs_unsent):
+            if not self.fs_send(rid, self.fs_unsent[rid]):
+                break
+        if now >= self.fs_prune_next:
+            self.fs_prune()
+        wait = FILE_RETRY if self.fs_unsent else 60
+        if not self.listening():
+            wait = min(wait, max(0.2, self.fs_poll_next - time.time()))
+        return wait
+
+    def fs_take(self, box):
+        for rid in sorted(box):
+            if rid in self.fs_done or rid in self.fs_unsent:
+                continue
+            if not FS_RID_RE.match(rid):
+                self.say("Arquivos: pedido de listagem %r recusado (identificador inválido)" % rid[:40])
+                with contextlib.suppress(CloudError):
+                    self.live.patch("", {"db_requests/%s/%s/%s" % (self.sid, FS_INBOX, rid): None})
+                continue
+            self.fs_done[rid] = time.time()
+            self.fs_send(rid, self.fs_answer(rid, box[rid]))
+        self.fs_done = {r: t for r, t in self.fs_done.items() if r in box}   # removido = pode esquecer
+
+    def fs_send(self, rid, doc):
+        """Resposta + remoção do pedido num PATCH; falha = guarda para reenviar."""
+        try:
+            self.live.patch("", {"fs_listing/%s/%s" % (self.sid, rid): doc,
+                                 "db_requests/%s/%s/%s" % (self.sid, FS_INBOX, rid): None})
+        except CloudError:
+            self.fs_unsent[rid] = doc
+            return False
+        self.fs_unsent.pop(rid, None)
+        self.fs_st["listings"][rid] = time.time()
+        self.fs_save()
+        return True
+
+    def fs_prune(self):
+        """Apaga as listagens que este agente gravou há mais de FS_KEEP (a central apaga as que leu)."""
+        now = time.time()
+        self.fs_prune_next = now + FS_PRUNE_EVERY
+        old = sorted(r for r, t in self.fs_st["listings"].items() if t < now - FS_KEEP)
+        if not old:
+            return
+        try:
+            self.live.patch("", {"fs_listing/%s/%s" % (self.sid, r): None for r in old})
+        except CloudError:
+            self.fs_prune_next = now + FILE_RETRY
+            return
+        for r in old:
+            del self.fs_st["listings"][r]
+        self.fs_save()
+
+    def fs_doc(self, state, path=None, code=None, msg=None):
+        doc = {"state": state, "updated_at": {".sv": "timestamp"}, "agent_version": VERSION}
+        if isinstance(path, str) and path:
+            doc["path"] = clip(path, FS_PATH_MAX)
+        if code:
+            doc["error_code"], doc["error"] = code, clip(msg or code, 300)
+        return doc
+
+    def fs_answer(self, rid, d):
+        """Documento de fs_listing/{sid}/{rid} para o pedido (nunca levanta)."""
+        path = d.get("path") if isinstance(d, dict) else None
+        try:
+            return self.fs_list(rid, d)
+        except FileError as e:
+            state = "erro" if e.code in ("sem_permissao", "nao_existe", "nao_e_pasta", "leitura") else "recusado"
+            self.say("Arquivos: listagem %s %s (%s: %s)" % (rid, state, e.code, e))
+            return self.fs_doc(state, getattr(e, "path", None) or path, e.code, str(e))
+
+    def fs_check(self, rid, d):
+        if not isinstance(d, dict) or not all(k in d for k in FS_FIELDS):
+            raise FileError("pedido_invalido", "pedido incompleto")
+        if (d["op"] != "listar" or not isinstance(d["path"], str) or not is_int(d["ts"])
+                or not isinstance(d["sig"], str) or not FILE_SIG_RE.match(d["sig"])):
+            raise FileError("pedido_invalido", "pedido com campo inválido")
+        if self.live.server_now() * 1000 - d["ts"] > FS_EXPIRE * 1000:
+            raise FileError("expirado", "pedido de listagem expirado")
+        key = read_catkey(self.key_path)
+        if key is None:
+            raise FileError("sem_chave", "o agente não tem a chave do catálogo (no servidor: --catalogo-chave)")
+        if not hmac.compare_digest(fs_sig(key, self.sid, rid, d["path"], d["ts"]), d["sig"]):
+            raise FileError("assinatura", "assinatura do pedido não confere com a chave do catálogo deste agente")
+
+    def fs_list(self, rid, d):
+        self.fs_check(rid, d)
+        path, sep = d["path"], "\\" if IS_WINDOWS else "/"
+        base = {"sep": sep, "files_dir": clip(self.dir, FS_PATH_MAX)}
+        if path == "*" and IS_WINDOWS:                    # raízes do Windows: as unidades
+            roots = win_roots()
+            doc = self.fs_doc("ok", "*")
+            doc.update(base, root="*", total=len(roots), truncated=len(roots) > FS_MAX_ENTRIES,
+                       entries={"%04d" % i: {"n": r, "t": "d", "b": False}
+                                for i, r in enumerate(roots[:FS_MAX_ENTRIES])})
+            return doc
+        if path == "":
+            os.makedirs(self.dir, exist_ok=True)
+            path = self.dir
+        elif path == "*":
+            path = "/"
+        if not fs_path_ok(path):
+            raise FileError("pedido_invalido", "caminho inválido para este servidor: %s" % clip(path, 200))
+        real = os.path.realpath(os.path.normpath(path))
+        if self.blocked_any(path):
+            e = FileError("bloqueado", "pasta bloqueada (contém segredos): %s" % clip(real, 200))
+            e.path = real
+            raise e
+        try:
+            it = os.scandir(real)
+        except OSError as ex:
+            e = self.fs_error(ex, real, "pasta")
+            e.path = real
+            raise e
+        items = []
+        with it:
+            for en in it:
+                try:
+                    link = en.is_symlink()
+                    kind = "l" if link else "d" if en.is_dir(follow_symlinks=False) else (
+                        "f" if en.is_file(follow_symlinks=False) else "o")
+                except OSError:
+                    link, kind = False, "o"
+                items.append((0 if kind == "d" else 1, en.name.lower(), en.name, kind, link, en))
+        total = len(items)
+        keep = heapq.nsmallest(FS_MAX_ENTRIES, items, key=lambda x: x[:3])
+        entries = {}
+        for i, (_, _, name, kind, link, en) in enumerate(keep):
+            e = {"n": fs_name(name), "t": kind, "b": False}
+            with contextlib.suppress(OSError, ValueError, OverflowError):
+                st = en.stat(follow_symlinks=False)
+                e["m"] = int(st.st_mtime * 1000)
+                if kind == "f":
+                    e["s"] = int(st.st_size)
+            full = os.path.join(real, name)
+            e["b"] = self.blocked(full) or (link and self.blocked(os.path.realpath(full)))
+            entries["%04d" % i] = e
+        parent = os.path.dirname(real)
+        doc = self.fs_doc("ok", real)
+        doc.update(base, root=(os.path.splitdrive(real)[0] + "\\") if IS_WINDOWS else "/", total=total,
+                   truncated=total > FS_MAX_ENTRIES)
+        if entries:
+            doc["entries"] = entries
+        if parent != real:
+            doc["parent"] = clip(parent, FS_PATH_MAX)
+        return doc
+
+    @staticmethod
+    def fs_error(ex, path, what):
+        if isinstance(ex, FileNotFoundError):
+            return FileError("nao_existe", "%s não existe: %s" % (what, clip(path, 200)))
+        if isinstance(ex, NotADirectoryError):
+            return FileError("nao_e_pasta", "não é uma pasta: %s" % clip(path, 200))
+        if isinstance(ex, PermissionError):
+            return FileError("sem_permissao", "sem permissão de leitura: %s" % clip(path, 200))
+        return FileError("leitura", "não consegui ler %s (%s)" % (clip(path, 200), str(ex)[:120]))
+
+    # ---- trazer arquivo (v2.22): subida para o depósito ----
+    def take_pull(self, box):
+        for fid in sorted(box):
+            if fid in self.st["pulls"] or fid in self.st["pulled"]:
+                continue
+            if not FILE_ID_RE.match(fid):
+                self.say("Arquivos: pedido de arquivo %r recusado (identificador inválido)" % fid[:40])
+                with contextlib.suppress(CloudError):
+                    self.live.patch("", {"db_requests/%s/%s/%s" % (self.sid, PULL_INBOX, fid): None})
+                continue
+            self.pull_accept(fid, box[fid])
+        for fid in list(self.st["pulls"]):                # pedido removido pela central = cancelado
+            if fid not in box:
+                self.pull_finish(fid, FileError("cancelado", "pedido cancelado pela central"))
+
+    def pull_check(self, fid, d, info):
+        """Pedido validado → job {path real, name, size, mtime_ns, url, token, expires_at}; senão FileError (o que
+        já se sabe do arquivo, nome e tamanho, fica em `info` para o pull_status)."""
+        if not isinstance(d, dict) or not all(k in d for k in PULL_FIELDS):
+            raise FileError("pedido_invalido", "pedido incompleto")
+        if not (isinstance(d["path"], str) and isinstance(d["url"], str) and isinstance(d["token"], str)
+                and FILE_TOKEN_RE.match(d["token"]) and is_int(d["expires_at"]) and is_int(d["ts"])
+                and isinstance(d["sig"], str) and FILE_SIG_RE.match(d["sig"])):
+            raise FileError("pedido_invalido", "pedido com campo inválido")
+        if not file_url_ok(d["url"], fid, self.allowed_relays()):
+            raise FileError("url_nao_permitida", "endereço do depósito fora da lista de relays deste agente")
+        if d["expires_at"] <= self.live.server_now() * 1000:
+            raise FileError("expirado", "pedido expirado antes de ser atendido")
+        key = read_catkey(self.key_path)
+        if key is None:
+            raise FileError("sem_chave", "o agente não tem a chave do catálogo (no servidor: --catalogo-chave)")
+        if not hmac.compare_digest(pull_sig(key, self.sid, fid, d), d["sig"]):
+            raise FileError("assinatura", "assinatura do pedido não confere com a chave do catálogo deste agente")
+        if not fs_path_ok(d["path"]):
+            raise FileError("pedido_invalido", "caminho inválido para este servidor: %s" % clip(d["path"], 200))
+        real = os.path.realpath(os.path.normpath(d["path"]))
+        info["name"] = os.path.basename(real) or real
+        if self.blocked_any(d["path"]):
+            raise FileError("bloqueado", "arquivo bloqueado (segredo): %s" % clip(real, 200))
+        job = info
+        job.update(path=real, url=d["url"], token=d["token"], expires_at=d["expires_at"])
+        st = self.pull_stat(job)
+        job.update(size=st.st_size, mtime_ns=st.st_mtime_ns)
+        return job
+
+    def pull_stat(self, job):
+        """stat do arquivo pedido, conferindo tipo e tamanho (FileError final)."""
+        try:
+            st = os.stat(job["path"])
+        except OSError as ex:
+            raise self.fs_error(ex, job["path"], "arquivo")
+        if not stat.S_ISREG(st.st_mode):
+            raise FileError("nao_e_arquivo", "não é um arquivo comum (pasta ou especial): %s" % clip(job["path"], 200))
+        job["size"] = st.st_size
+        if st.st_size == 0:
+            raise FileError("vazio", "o arquivo está vazio: %s" % clip(job["path"], 200))
+        if st.st_size > FILE_MAX:
+            raise FileError("tamanho", "arquivo maior que %d MB (%d bytes)" % (FILE_MAX >> 20, st.st_size))
+        return st
+
+    def pull_accept(self, fid, d):
+        job = {"size": 0}
+        p = d.get("path") if isinstance(d, dict) else None
+        if isinstance(p, str) and p:
+            job["name"] = clip(p.replace("\\", "/").rstrip("/").split("/")[-1] or p, 255)
+        try:
+            job = self.pull_check(fid, d, job)
+        except FileError as e:
+            self.say("Arquivos: pedido de arquivo %s recusado (%s: %s)" % (fid, e.code, e))
+            self.pull_finish(fid, e, job=job)
+            return
+        job["accepted_at"] = time.time()
+        self.st["pulls"][fid] = job
+        self.save()
+        self.say("Arquivos: a central pediu %s (%d bytes, pedido %s)" % (job["path"], job["size"], fid))
+        self.pull_status(fid, "recebido", 0)
+
+    def pull_doc(self, state, job, nbytes, err=None, sha=None):
+        job = job or {}
+        name = job.get("name") if isinstance(job.get("name"), str) and job.get("name") else "?"
+        doc = {"state": state, "updated_at": {".sv": "timestamp"}, "agent_version": VERSION,
+               "name": fs_name(name), "size": int(job.get("size") or 0) if is_int(job.get("size")) else 0,
+               "bytes": int(nbytes)}
+        if sha:
+            doc["sha256"] = sha
+        if err is not None:
+            doc["error_code"], doc["error"] = err.code, clip(str(err), 300)
+        return doc
+
+    def pull_status(self, fid, state, nbytes, err=None):
+        """Progresso (melhor esforço)."""
+        doc = self.pull_doc(state, self.st["pulls"].get(fid), nbytes, err)
+        with contextlib.suppress(CloudError):
+            self.live.patch("", {"pull_status/%s/%s" % (self.sid, fid): doc})
+
+    def pull_finish(self, fid, err=None, job=None, nbytes=0, sha=None):
+        job = self.st["pulls"].pop(fid, None) or job
+        self.pull_retry.pop(fid, None)
+        state = "pronto" if err is None else "recusado" if err.code in PULL_REFUSE else "erro"
+        doc = self.pull_doc(state, job, nbytes, err, sha)
+        self.st["pulled"][fid] = {"at": time.time(), "state": state, "doc": doc}
+        self.save()
+        self.say("Arquivos: pedido de arquivo %s %s (%s%s)" % (
+            fid, state, doc["name"], ", %s %s" % (err.code, err) if err is not None else ", sha256 %s" % sha))
+        self.pull_flush_one(fid)
+
+    def pull_flush_one(self, fid):
+        d = self.st["pulled"].get(fid)
+        if not d or "doc" not in d:
+            return True
+        try:
+            self.live.patch("", {"pull_status/%s/%s" % (self.sid, fid): d["doc"],
+                                 "db_requests/%s/%s/%s" % (self.sid, PULL_INBOX, fid): None})
+        except CloudError:
+            self.flush_next = time.time() + FILE_RETRY
+            return False
+        d.pop("doc", None)
+        self.save()
+        return True
+
+    def pull_run(self, fid, job, fails):
+        try:
+            sha = self.upload(fid, job)
+        except FileError as e:
+            if e.final or job.get("expires_at", 0) <= self.live.server_now() * 1000:
+                self.pull_finish(fid, e if e.final else FileError("expirado", "pedido expirou sem conseguir enviar "
+                                                                              "(%s)" % e), nbytes=job.get("sent", 0))
+                return
+            fails += 1
+            self.pull_retry[fid] = (fails, time.time() + min(FILE_RETRY_MAX, FILE_RETRY * 2 ** (fails - 1)))
+            self.say("Arquivos: envio de %s falhou (%s); nova tentativa em %d s" % (
+                fid, e, self.pull_retry[fid][1] - time.time()))
+            self.pull_status(fid, "enviando", job.get("sent", 0), e)
+            return
+        self.pull_finish(fid, nbytes=job["size"], sha=sha)
+
+    def upload(self, fid, job):
+        """Lê (SHA-256), sobe em pedaços com retomada e fecha a vaga. Devolve o sha256."""
+        if job["expires_at"] <= self.live.server_now() * 1000:
+            raise FileError("expirado", "pedido expirou antes de terminar o envio")
+        st = self.pull_stat(job)
+        if "sha256" not in job or (st.st_size, st.st_mtime_ns) != (job["size"], job.get("mtime_ns")):
+            self.pull_read(fid, job)
+        self.push(fid, job)
+        return job["sha256"]
+
+    def pull_read(self, fid, job):
+        """SHA-256 em streaming; mudou (tamanho/mtime) durante a leitura = lê de novo uma vez, depois arquivo_mudou."""
+        while True:
+            if job.get("reads", 0) >= 2:
+                raise FileError("arquivo_mudou", "o arquivo mudou durante a leitura (2 tentativas): %s" %
+                                clip(job["path"], 200))
+            job["reads"] = job.get("reads", 0) + 1
+            job.pop("sha256", None)
+            s1 = self.pull_stat(job)
+            self.pull_status(fid, "lendo", 0)
+            h, n = hashlib.sha256(), 0
+            try:
+                with open(job["path"], "rb") as f:
+                    for chunk in iter(lambda: f.read(PULL_READ), b""):
+                        if self.stop_ev.is_set():
+                            raise FileError("leitura", "agente parando", final=False)
+                        h.update(chunk)
+                        n += len(chunk)
+                s2 = os.stat(job["path"])
+            except OSError as ex:
+                raise self.fs_error(ex, job["path"], "arquivo")
+            if n == s1.st_size and (s2.st_size, s2.st_mtime_ns) == (s1.st_size, s1.st_mtime_ns):
+                job.update(size=n, mtime_ns=s1.st_mtime_ns, sha256=h.hexdigest())
+                self.save()
+                return
+
+    def throttle(self, n):
+        t0, sent, rate = self.tx
+        sent += n
+        self.tx = (t0, sent, rate)
+        if self.stop_ev.is_set():
+            raise OSError("agente parando")
+        if rate:
+            delay = sent / rate - (time.monotonic() - t0)
+            if delay > 0:
+                self.stop_ev.wait(delay)
+
+    def depot(self, req, what, missing_ok=False):
+        """Abre um pedido no depósito. Recusa (401/403/404/410/413/422) = FileError final; 409/507/5xx/rede = tenta
+        de novo. missing_ok: 404 devolve None (HEAD antes do primeiro pedaço)."""
+        try:
+            return file_opener().open(req, timeout=FILE_TIMEOUT)
+        except urllib.error.HTTPError as e:
+            with contextlib.suppress(Exception):
+                e.close()
+            if missing_ok and e.code == 404:
+                return None
+            if e.code in (401, 403, 404, 410):
+                raise FileError("envio", "o depósito recusou o %s (HTTP %d: cancelado, expirado ou sem permissão)" % (
+                    what, e.code))
+            if e.code in (413, 422):
+                raise FileError("envio", "o depósito recusou o %s (HTTP %d: tamanho ou SHA-256)" % (what, e.code))
+            raise FileError("envio", "o depósito respondeu HTTP %d ao %s" % (e.code, what), final=False)
+        except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError) as e:
+            raise FileError("envio", "sem conexão com o depósito (%s)" % (
+                str(getattr(e, "reason", "") or e)[:160] or type(e).__name__), final=False)
+
+    def push(self, fid, job):
+        headers = {"Authorization": "C2Up " + job["token"], "User-Agent": "usage-monitor/" + VERSION}
+        size = job["size"]
+        resp = self.depot(urllib.request.Request(job["url"], headers=headers, method="HEAD"), "envio", True)
+        off = None
+        if resp is not None:                              # 404 = nada recebido ainda
+            off = resp.headers.get("X-C2-Offset")
+            with contextlib.suppress(Exception):
+                resp.close()
+        try:
+            offset = int(off or 0)
+        except ValueError:
+            offset = 0
+        if not 0 <= offset <= size:
+            raise FileError("envio", "o depósito tem mais bytes (%d) que o arquivo (%d)" % (offset, size))
+        h = hashlib.sha256()
+        self.tx = (time.monotonic(), 0, self.rate())
+        job["sent"] = offset
+        try:
+            with open(job["path"], "rb") as f:
+                left = offset                             # o que já está no depósito entra no SHA-256
+                while left:
+                    b = f.read(min(PULL_READ, left))
+                    if not b:
+                        raise FileError("arquivo_mudou", "o arquivo diminuiu durante o envio")
+                    h.update(b)
+                    left -= len(b)
+                self.pull_status(fid, "enviando", offset)
+                last = time.monotonic()
+                while offset < size:
+                    n = min(PULL_CHUNK, size - offset)
+                    body = PullBody(f, n, h, self)
+                    req = urllib.request.Request("%s?offset=%d" % (job["url"], offset), data=body, method="PUT",
+                                                 headers=dict(headers, **{"Content-Length": str(n),
+                                                                          "Content-Type": "application/octet-stream"}))
+                    try:
+                        resp = self.depot(req, "pedaço")
+                    except FileError:
+                        if body.short:
+                            raise FileError("arquivo_mudou", "o arquivo diminuiu durante o envio")
+                        raise
+                    with contextlib.suppress(Exception):
+                        resp.read()
+                        resp.close()
+                    offset += n
+                    job["sent"] = offset
+                    if time.monotonic() - last >= FILE_PROGRESS:
+                        last = time.monotonic()
+                        self.pull_status(fid, "enviando", offset)
+        except OSError as ex:
+            raise self.fs_error(ex, job["path"], "arquivo")
+        st = os.stat(job["path"])
+        if h.hexdigest() != job["sha256"] or (st.st_size, st.st_mtime_ns) != (size, job["mtime_ns"]):
+            raise FileError("arquivo_mudou", "o arquivo mudou durante o envio: %s" % clip(job["path"], 200))
+        req = urllib.request.Request(job["url"] + "/fim", method="POST",
+                                     data=json.dumps({"size": size, "sha256": job["sha256"]}).encode(),
+                                     headers=dict(headers, **{"Content-Type": "application/json"}))
+        resp = self.depot(req, "fechamento")
+        with contextlib.suppress(Exception):
+            resp.read()
+            resp.close()
 
 
 # --------------------------------------------------------------------------
