@@ -102,7 +102,7 @@ except ImportError:
 from array import array
 from xml.sax.saxutils import escape as xml_escape
 
-VERSION = "2.19.0"
+VERSION = "2.20.0"
 # Projeto Firebase da C2 (padrão do --firebase-setup). Não são segredos: a URL só identifica o banco e
 # a chave só identifica o projeto (restrita às APIs de login); o acesso é decidido pelas regras.
 FIREBASE_DB_URL = "https://c2-server-monitor-default-rtdb.firebaseio.com"
@@ -4251,7 +4251,8 @@ class CloudSync:
         # disk.sda.seq_read_MBs → disk_sda_seq_read_MBs (o relatório local continua com pontos)
         bench = {rtdb_key(k, 96): v for k, v in bench_dict(lines).items()}
         doc = clip({**self.ident_doc(), "monitor_version": VERSION, "timezone": clip(timezone_name(), RTDB_ID_MAX),
-                    "hardware": hw, "benchmark": bench, "benchmark_measured": src.get("when", "")[:40]})
+                    "hardware": hw, "benchmark": bench, "benchmark_measured": src.get("when", "")[:40],
+                    "files_dir": clip(os.path.join(self.base, FILE_DIR), 400)})   # v2.20: recebidos (envio de arquivos)
         h = hashlib.sha1(json.dumps(doc, sort_keys=True).encode()).hexdigest()
         doc["updated_at_ms"] = {".sv": "timestamp"}
         doc.update(self.sql_info)                     # info/<sid> é sobrescrito inteiro: a impressão digital vai junto
@@ -11067,6 +11068,7 @@ FILE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{32,64}$")
 FILE_NAME_RE = re.compile(r'^[^\\/:*?"<>|\x00-\x1f]{1,200}$')
 FILE_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 FILE_SIG_RE = re.compile(r"^[0-9a-f]{64}$")
+FILE_SUBDIR_RE = re.compile(r"^[A-Za-z0-9._ -]+(/[A-Za-z0-9._ -]+)*$")   # v2.20: subpasta relativa em recebidos/
 FILE_WIN_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {"COM%d" % i for i in range(1, 10)} | {"LPT%d" % i for i in range(1, 10)}
 FILE_FIELDS = ("name", "size", "sha256", "url", "token", "overwrite", "expires_at", "created_at", "by_name", "sig")
 
@@ -11080,15 +11082,26 @@ class FileError(Exception):
 
 
 def file_sig(key, sid, fid, d):
-    """Assinatura do pedido (HMAC-SHA256 com a chave do catálogo): amarra servidor, arquivo, destino e validade."""
-    text = "\n".join(["c2-file-v1", sid, fid, d["name"], str(d["size"]), d["sha256"], d.get("dest_path") or "",
-                      "1" if d.get("overwrite") else "0", str(d["expires_at"])])
+    """Assinatura do pedido (HMAC-SHA256 com a chave do catálogo): amarra servidor, arquivo, destino e validade.
+    Com `subdir` (v2.20) o texto é o "c2-file-v2", que inclui a subpasta; sem ela, o "c2-file-v1" de sempre."""
+    sub = d.get("subdir")
+    head = ["c2-file-v2" if sub else "c2-file-v1", sid, fid, d["name"], str(d["size"]), d["sha256"], d.get("dest_path") or ""]
+    text = "\n".join(head + ([sub] if sub else []) + ["1" if d.get("overwrite") else "0", str(d["expires_at"])])
     return hmac.new(key, text.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def file_name_ok(name):
     return (isinstance(name, str) and FILE_NAME_RE.match(name) is not None and ".." not in name
             and not name.endswith((".", " ")) and name.split(".")[0].upper() not in FILE_WIN_RESERVED)
+
+
+def file_subdir_ok(sub):
+    """Subpasta relativa dentro de recebidos/ (v2.20): partes [A-Za-z0-9._ -] separadas por "/", sem "."/"..",
+    sem parte terminando em ponto/espaço nem nome reservado do Windows; até 200 caracteres."""
+    if not isinstance(sub, str) or not 1 <= len(sub) <= 200 or FILE_SUBDIR_RE.match(sub) is None:
+        return False
+    return all(p not in (".", "..") and p == p.strip() and not p.endswith(".") and
+               p.split(".")[0].upper() not in FILE_WIN_RESERVED for p in sub.split("/"))
 
 
 def file_dest_ok(path, windows=None):
@@ -11260,7 +11273,8 @@ class FileReceiver:
               and FILE_SHA_RE.match(d["sha256"]) and isinstance(d["token"], str) and FILE_TOKEN_RE.match(d["token"])
               and isinstance(d["overwrite"], bool) and is_int(d["expires_at"]) and is_num(d["created_at"])
               and isinstance(d["sig"], str) and FILE_SIG_RE.match(d["sig"]) and isinstance(d["url"], str)
-              and (d.get("dest_path") is None or isinstance(d["dest_path"], str)))
+              and (d.get("dest_path") is None or isinstance(d["dest_path"], str))
+              and (d.get("subdir") is None or isinstance(d["subdir"], str)))
         if not ok:
             raise FileError("pedido_invalido", "pedido com campo inválido")
         if not file_name_ok(d["name"]):
@@ -11269,6 +11283,8 @@ class FileReceiver:
             raise FileError("tamanho", "tamanho fora do limite (máximo %d MB)" % (FILE_MAX >> 20))
         if not file_url_ok(d["url"], fid, self.allowed_relays()):
             raise FileError("url_nao_permitida", "endereço do depósito fora da lista de relays deste agente")
+        if d.get("subdir") is not None and not file_subdir_ok(d["subdir"]):
+            raise FileError("destino_invalido", "subpasta inválida: %s" % clip(d["subdir"], 200))
         if d.get("dest_path") is not None and not file_dest_ok(d["dest_path"]):
             raise FileError("destino_invalido", "destino inválido para este servidor: %s" % clip(d["dest_path"], 300))
         now_ms = self.live.server_now() * 1000
@@ -11281,7 +11297,7 @@ class FileReceiver:
             raise FileError("sem_chave", "o agente não tem a chave do catálogo (no servidor: --catalogo-chave)")
         if not hmac.compare_digest(file_sig(key, self.sid, fid, d), d["sig"]):
             raise FileError("assinatura", "assinatura do pedido não confere com a chave do catálogo deste agente")
-        return {k: d[k] for k in FILE_FIELDS + ("dest_path",) if k in d and k != "sig"}
+        return {k: d[k] for k in FILE_FIELDS + ("dest_path", "subdir") if k in d and k != "sig"}
 
     def allowed_relays(self):
         acfg = getattr(self.cloud, "acfg", None)
@@ -11423,9 +11439,13 @@ class FileReceiver:
                 self.save()
                 raise FileError("sha256", "o arquivo baixado não confere com o SHA-256 do pedido", final=False)
             raise FileError("sha256", "o arquivo baixado não confere com o SHA-256 do pedido (2 tentativas)")
-        saved = self.store(fid, job, part)
+        try:
+            saved, kept = self.store(fid, job, part)
+        except FileError as e:
+            self.finish(fid, "erro", e, job=job, nbytes=have)
+            return
         if not job.get("dest_path"):
-            self.finish(fid, "gravado", job=job, saved=saved, nbytes=have)
+            self.finish(fid, "gravado", job=job, saved=saved, backup=kept, nbytes=have)
             return
         try:
             backup = self.install(fid, saved, job)
@@ -11491,15 +11511,41 @@ class FileReceiver:
         return have, h
 
     def store(self, fid, job, part):
+        """Grava o arquivo baixado. Sem subpasta: recebidos/<AAAAMMDD-HHMMSS>_<nome> (nunca sobrescreve). Com subpasta
+        (v2.20): recebidos/<subpasta>/<nome original>; já existe = só com `overwrite`, guardando o anterior como
+        .bak-<data> ao lado. Devolve (caminho gravado, cópia de segurança ou None)."""
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        dst = os.path.join(self.dir, "%s_%s" % (stamp, job["name"]))
-        if os.path.lexists(dst):
-            dst = os.path.join(self.dir, "%s_%s_%s" % (stamp, fid[:8], job["name"]))
+        sub = job.get("subdir")
+        if not sub:
+            dst = os.path.join(self.dir, "%s_%s" % (stamp, job["name"]))
+            if os.path.lexists(dst):
+                dst = os.path.join(self.dir, "%s_%s_%s" % (stamp, fid[:8], job["name"]))
+            try:
+                os.replace(part, dst)
+            except OSError as e:
+                raise FileError("gravacao", "não consegui gravar em %s (%s)" % (dst, e))
+            return dst, None
+        folder = os.path.join(self.dir, *sub.split("/"))
+        dst = os.path.join(folder, job["name"])
+        backup = None
         try:
+            os.makedirs(folder, exist_ok=True)
+            if os.path.lexists(dst):
+                if os.path.isdir(dst):
+                    raise FileError("destino_invalido", "já existe uma pasta com o nome do arquivo: %s" % dst)
+                if not job["overwrite"]:
+                    raise FileError("destino_existe", "já existe %s e o envio não permite sobrescrever" % dst)
+                backup = "%s.bak-%s" % (dst, stamp)
+                shutil.copy2(dst, backup)
             os.replace(part, dst)
         except OSError as e:
+            if backup:
+                with contextlib.suppress(OSError):
+                    os.remove(backup)
+            if IS_WINDOWS and (isinstance(e, PermissionError) or getattr(e, "winerror", None) in (5, 32, 33)):
+                raise FileError("arquivo_em_uso", "o arquivo está em uso (feche o programa e envie de novo): %s" % dst)
             raise FileError("gravacao", "não consegui gravar em %s (%s)" % (dst, e))
-        return dst
+        return dst, backup
 
     def install(self, fid, saved, job):
         """Copia para dest_path: troca atômica (temporário na mesma pasta + os.replace), com .bak do anterior."""
