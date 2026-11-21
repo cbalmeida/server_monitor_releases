@@ -102,7 +102,7 @@ except ImportError:
 from array import array
 from xml.sax.saxutils import escape as xml_escape
 
-VERSION = "2.18.0"
+VERSION = "2.19.0"
 # Projeto Firebase da C2 (padrão do --firebase-setup). Não são segredos: a URL só identifica o banco e
 # a chave só identifica o projeto (restrita às APIs de login); o acesso é decidido pelas regras.
 FIREBASE_DB_URL = "https://c2-server-monitor-default-rtdb.firebaseio.com"
@@ -1684,6 +1684,7 @@ class Monitor:
         self.prof = None                # Profiler (profile do banco pedido pela central), junto com o DbAgent
         self.sql = None                 # SqlEditor (editor SQL remoto, v2.12), junto com o DbAgent
         self.queues = None              # QueueReader (filas ERP, v2.18), junto com o DbAgent
+        self.files = None               # FileReceiver (arquivos enviados pela central, v2.19)
 
     def say(self, s):
         if self.out:
@@ -2061,6 +2062,8 @@ class Monitor:
             self.queues.stop()
         if self.prof is not None:
             self.prof.stop()
+        if self.files is not None:
+            self.files.stop()
         if self.sql is not None:
             self.sql.stop()
         if self.db is not None:
@@ -3177,12 +3180,14 @@ SYNC_DEFAULTS = {
     "db_profiler": True,         # v2.16: profile do banco pedido pela central (prof_*; exige db_access)
     "prof_keep": 20,             # sessões de profile mantidas (Firebase e cópia local)
     "prof_days": 180,            # dias máximos de um profile no Firebase/cópia local
+    "file_receive": True,        # v2.19: recebe arquivos enviados pela central (recebidos/ e destino opcional)
 }
 HIST_MIN_GAP = 600               # mudança de estado só antecipa o histórico se o último envio tiver > 10 min
 HB_POLL = 5                      # s entre verificações da thread do heartbeat
 HB_BACKOFF, HB_BACKOFF_MAX = 15, 60   # espera após falha do heartbeat: 15 s, 30 s, 60 s, 60 s...
 HB_SUFFIX = ".hb"                 # live_path(log) + HB_SUFFIX, em RAM (/dev/shm): último heartbeat / falhas (para o --view)
-SIGNAL_KEYS = ("release", "config_at", "catalog_at", "agent_config_at", "rename_at")   # avisos da central em signals/<sid> (v2.6.1; v2.11; v2.14)
+SIGNAL_KEYS = ("release", "config_at", "catalog_at", "agent_config_at", "rename_at",
+               "file_at")        # avisos da central em signals/<sid> (v2.6.1; v2.11; v2.14; v2.19)
 RENAME_REFRESH = 6 * 3600        # s entre releituras de garantia de rename/<sid> (o aviso signals/<sid>/rename_at antecipa)
 RENAME_RETRY = 300               # s até tentar de novo uma leitura/confirmação de renome que falhou
 NAME_MAX = 80                    # empresa e nome do servidor: até 80 caracteres (--empresa/--nome, renome pela central)
@@ -4418,7 +4423,9 @@ AGENT_CFG_INTS = {("biz", "heartbeat_s"): (30, 3600), ("biz", "status_s"): (60, 
                   ("update", "interval_s"): (300, 86400),
                   # filas ERP (v2.18): limites da pressão (padrão QUEUE_DEFAULTS)
                   ("queue", "in_queues"): (1, 10 ** 9), ("queue", "not_queued"): (1, 10 ** 9),
-                  ("queue", "wait_s"): (60, 7 * 86400), ("queue", "stale_s"): (30, 86400), ("queue", "crit_factor"): (2, 100)}
+                  ("queue", "wait_s"): (60, 7 * 86400), ("queue", "stale_s"): (30, 86400), ("queue", "crit_factor"): (2, 100),
+                  # arquivos enviados pela central (v2.19): limite de banda do download em kbit/s (0 = sem limite)
+                  ("files", "max_kbps"): (0, 10 ** 6)}
 AGENT_CFG_STRS = (("schedule", "days"), ("schedule", "hours"), ("collect", "biz_hours"), ("update", "window"))
 HOURS_RE = re.compile(r"^([0-9]|1[0-9]|2[0-3])-([0-9]|1[0-9]|2[0-4])$")
 
@@ -4626,6 +4633,7 @@ class SyncManager:
         self._live_ok = False
         self.hb_lock = threading.Lock()               # um envio de heartbeat por vez (o final do stop por último)
         self.updater = self.db = None                 # avisados por signals/<sid> (ligados pelo main)
+        self.files = None                             # FileReceiver (v2.19): signals/<sid>/file_at
         self.signals_seen, self.signals_at = None, 0.0   # últimos valores lidos (None = ainda não leu) e quando
         self.acfg_next = 0.0                          # próxima leitura de agent_config (0 = na partida)
         self.hb_force = False                         # configuração nova: heartbeat já (anuncia interval/offline novos)
@@ -4834,6 +4842,9 @@ class SyncManager:
         if cur["rename_at"] != prev["rename_at"]:
             self.check_rename()
             woke.append("rename")
+        if cur["file_at"] != prev["file_at"] and self.files is not None:
+            self.files.wake()
+            woke.append("files")
         return woke
 
     def check_rename(self):
@@ -5795,6 +5806,7 @@ class DbAgent:
         self.shm_lock = threading.Lock()
         self.sql = None                   # SqlEditor (v2.12): recebe os pedidos de sessão desta mesma escuta
         self.prof = None                  # Profiler (v2.16): recebe os pedidos de profile desta mesma escuta
+        self.files = None                 # FileReceiver (v2.19): recebe os pedidos de arquivo desta mesma escuta
         self.vers_sent, self.vers_at = None, 0.0   # db_versions (v2.17): último documento gravado e quando
 
     # ---- ciclo de vida ----
@@ -6088,10 +6100,13 @@ class DbAgent:
         if self.prof is not None:                         # profile do banco (v2.16): db_requests/{sid}/prof
             inbox = self.pending.get(PROF_INBOX)
             self.prof.inbox(dict(inbox) if isinstance(inbox, dict) else {})
+        if self.files is not None:                        # arquivos (v2.19): db_requests/{sid}/file
+            inbox = self.pending.get(FILE_INBOX)
+            self.files.inbox(dict(inbox) if isinstance(inbox, dict) else {})
         for rid in sorted(self.pending):
             if self.stop_ev.is_set():
                 break
-            if rid not in self.done and rid not in (SQL_INBOX, PROF_INBOX):
+            if rid not in self.done and rid not in (SQL_INBOX, PROF_INBOX, FILE_INBOX):
                 self.handle(rid, self.pending[rid])
 
     def answer(self, rid, op_id, params, at):
@@ -11027,6 +11042,528 @@ def ask_catkey(ident, live=None, force=False):
 
 
 # --------------------------------------------------------------------------
+# Arquivos enviados pela central (v2.19, contrato em docs/ENVIO_ARQUIVOS.md): a central sobe o arquivo uma vez no
+# depósito do relay (/f/<fid>) e grava um pedido assinado por servidor; o agente baixa (com retomada), confere o
+# SHA-256 e grava em <pasta do agente>/recebidos (e, se pedido, no destino, com .bak). Nunca executa nada.
+# --------------------------------------------------------------------------
+FILE_INBOX = "file"                # db_requests/{sid}/file/{fid}: pedidos da central (mesma escuta do DbAgent)
+FILE_STATE = "files.json"          # SYNC_DIR/files.json: downloads aceitos (retomada após reinício) e concluídos
+FILE_DIR = "recebidos"             # <pasta do agente>/recebidos/<AAAAMMDD-HHMMSS>_<nome>
+FILE_PART_DIR = ".parcial"         # recebidos/.parcial/<fid>.part: download em andamento
+FILE_MAX = 200 * 1024 * 1024       # bytes por arquivo
+FILE_VALID_MAX = 31 * 86400 * 1000 # ms: validade máxima de um pedido (30 dias + folga de relógio)
+FILE_FREE_MARGIN = 200 * 1024 * 1024   # espaço livre exigido além de 2 x o tamanho
+FILE_POLL = 600                    # s: leitura de garantia de db_requests/{sid}/file sem a escuta do DbAgent
+FILE_PROGRESS = 5                  # s entre gravações do progresso em file_status
+FILE_RETRY, FILE_RETRY_MAX = 30, 900   # espera crescente entre tentativas de download
+FILE_TIMEOUT = 60                  # s sem resposta do depósito
+FILE_CHUNK = 64 * 1024
+FILE_KEEP_DAYS, FILE_KEEP_BYTES = 30, 2 * 1024 ** 3   # recebidos: idade máxima e total máximo
+FILE_CLEAN_EVERY = 6 * 3600        # s entre limpezas dos recebidos
+FILE_PART_STALE = 86400            # s: .part sem download aceito é apagado
+FILE_DONE_KEEP = 40 * 86400        # s: lembrança dos pedidos concluídos (reentregue = não repete)
+FILE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{22,40}$")
+FILE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{32,64}$")
+FILE_NAME_RE = re.compile(r'^[^\\/:*?"<>|\x00-\x1f]{1,200}$')
+FILE_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+FILE_SIG_RE = re.compile(r"^[0-9a-f]{64}$")
+FILE_WIN_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {"COM%d" % i for i in range(1, 10)} | {"LPT%d" % i for i in range(1, 10)}
+FILE_FIELDS = ("name", "size", "sha256", "url", "token", "overwrite", "expires_at", "created_at", "by_name", "sig")
+
+
+class FileError(Exception):
+    """Falha de um pedido de arquivo: code = error_code do file_status; final = não tenta de novo."""
+
+    def __init__(self, code, msg, final=True):
+        super().__init__(msg)
+        self.code, self.final = code, final
+
+
+def file_sig(key, sid, fid, d):
+    """Assinatura do pedido (HMAC-SHA256 com a chave do catálogo): amarra servidor, arquivo, destino e validade."""
+    text = "\n".join(["c2-file-v1", sid, fid, d["name"], str(d["size"]), d["sha256"], d.get("dest_path") or "",
+                      "1" if d.get("overwrite") else "0", str(d["expires_at"])])
+    return hmac.new(key, text.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def file_name_ok(name):
+    return (isinstance(name, str) and FILE_NAME_RE.match(name) is not None and ".." not in name
+            and not name.endswith((".", " ")) and name.split(".")[0].upper() not in FILE_WIN_RESERVED)
+
+
+def file_dest_ok(path, windows=None):
+    """Destino absoluto deste sistema (Windows X:\\..., Linux /...), sem '.'/'..', terminando num nome válido."""
+    windows = IS_WINDOWS if windows is None else windows
+    if not isinstance(path, str) or not 3 <= len(path) <= 400:
+        return False
+    if windows:
+        if not re.match(r"^[A-Za-z]:\\", path) or "/" in path:
+            return False
+        parts = path[3:].split("\\")
+    else:
+        if not path.startswith("/") or "\\" in path:
+            return False
+        parts = path[1:].split("/")
+    return all(p not in ("", ".", "..") for p in parts) and file_name_ok(parts[-1])
+
+
+def file_url_ok(url, fid, relays):
+    """https://<relay permitido>/f/<fid>, sem usuário, consulta nem fragmento."""
+    try:
+        u = urllib.parse.urlsplit(url)
+        port = u.port or 443
+    except (ValueError, TypeError, AttributeError):
+        return False
+    if u.scheme != "https" or u.query or u.fragment or u.username or u.password or u.path != "/f/" + fid:
+        return False
+    host = (u.hostname or "").lower()
+    return any(sql_relay_split(r) == (host, port) for r in relays or ())
+
+
+def file_opener():
+    """HTTPS até o depósito: mesma cadeia do relay (raízes ISRG embutidas) e o proxy do ambiente (https_proxy)."""
+    return urllib.request.build_opener(urllib.request.HTTPSHandler(context=sql_relay_ctx()))
+
+
+class FileReceiver:
+    """Thread 'arquivos' (v2.19, docs/ENVIO_ARQUIVOS.md). Pedidos em db_requests/{sid}/file/{fid}: entregues pela escuta
+    do DbAgent quando ela está ativa; sem ela (db_access desligado, escuta caída) lê o nó a cada FILE_POLL e quando a
+    central avisa (signals/{sid}/file_at). Confere formato, URL (só relays permitidos), validade, tamanho, destino e a
+    assinatura (chave do catálogo) ANTES de baixar; um download por vez, com Range para retomar, limite de banda
+    (agent_config files.max_kbps), espera crescente nas falhas até expirar. Estado em SYNC_DIR/files.json (atômico):
+    aceitos (retomados na partida) e concluídos (o resultado é reenviado até o Firebase confirmar)."""
+
+    def __init__(self, cloud, db=None, out=None):
+        self.cloud, self.db, self.live, self.ident, self.out = cloud, db, cloud.live, cloud.ident, out
+        self.sid = self.ident.install_id
+        self.key_path = os.path.join(cloud.base, CATKEY_FILE)
+        self.dir = os.path.join(cloud.base, FILE_DIR)
+        self.part_dir = os.path.join(self.dir, FILE_PART_DIR)
+        self.path = os.path.join(cloud.dir, FILE_STATE)
+        self.stop_ev, self.wake_ev = threading.Event(), threading.Event()
+        self.mx = threading.Lock()
+        self.thread = None
+        self.box = None                   # espelho de db_requests/{sid}/file (None = ainda desconhecido)
+        self.poll_next = 0.0
+        self.retry = {}                   # fid -> (falhas, próxima tentativa)
+        self.flush_next = 0.0
+        self.st = self.load()
+        if db is not None:
+            db.files = self
+
+    def say(self, s):
+        if self.out:
+            self.out(s)
+
+    # ---- estado local ----
+    def load(self):
+        d = read_json(self.path)
+        d = d if isinstance(d, dict) else {}
+        st = {"cleaned_at": d["cleaned_at"] if is_num(d.get("cleaned_at")) else 0}
+        for k in ("jobs", "done"):
+            v = d.get(k)
+            st[k] = {f: x for f, x in v.items() if FILE_ID_RE.match(f) and isinstance(x, dict)} if isinstance(v, dict) else {}
+        return st
+
+    def save(self):
+        os.makedirs(self.cloud.dir, mode=0o700, exist_ok=True)
+        write_private(self.path, json.dumps(self.st, separators=(",", ":")))
+
+    # ---- ciclo de vida ----
+    def start(self):
+        self.thread = threading.Thread(target=self.loop, name="arquivos", daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_ev.set()
+        self.wake_ev.set()
+        if self.thread is not None and self.thread is not threading.current_thread():
+            self.thread.join(10)
+
+    def inbox(self, box):
+        """Chamado pela thread 'banco' com o filho db_requests/{sid}/file inteiro (espelho da escuta)."""
+        with self.mx:
+            self.box = dict(box)
+        self.wake_ev.set()
+
+    def wake(self):
+        """Aviso da central (signals/{sid}/file_at): lê os pedidos já."""
+        self.poll_next = 0.0
+        self.wake_ev.set()
+
+    def loop(self):
+        while not self.stop_ev.is_set():
+            try:
+                wait = self.step()
+            except Exception as e:                        # nunca derruba a thread
+                self.say("Arquivos: erro interno (%s: %s)" % (type(e).__name__, e))
+                wait = 30
+            self.wake_ev.wait(max(0.2, min(wait, 60)))
+            self.wake_ev.clear()
+
+    def enabled(self):
+        return self.ident.sync_cfg()["file_receive"]
+
+    def listening(self):
+        db = self.db
+        return db is not None and db.listen.is_set() and db.sse.get("state") == "ok"
+
+    def step(self):
+        if not self.enabled():
+            return 60
+        now = time.time()
+        if not self.listening() and now >= self.poll_next:
+            self.poll()
+        with self.mx:
+            box, self.box = self.box, None
+        if box is not None:
+            self.take(box)
+        if now >= self.flush_next:
+            self.flush()
+        wait = self.work()
+        if time.time() - self.st["cleaned_at"] >= FILE_CLEAN_EVERY:
+            self.clean()
+        if not self.listening():
+            wait = min(wait, max(0.2, self.poll_next - time.time()))
+        return wait
+
+    def poll(self):
+        self.poll_next = time.time() + FILE_POLL
+        try:
+            d = self.live.get("db_requests/%s/%s" % (self.sid, FILE_INBOX))
+        except CloudError:
+            self.poll_next = time.time() + FILE_RETRY
+            return
+        with self.mx:
+            self.box = d if isinstance(d, dict) else {}
+
+    # ---- pedidos ----
+    def take(self, box):
+        for fid in sorted(box):
+            if fid in self.st["jobs"] or fid in self.st["done"]:
+                continue
+            if not FILE_ID_RE.match(fid):                 # chave que nem cabe em file_status: só remove o pedido
+                self.say("Arquivos: pedido %r recusado (identificador inválido)" % fid[:40])
+                with contextlib.suppress(CloudError):
+                    self.live.patch("", {"db_requests/%s/%s/%s" % (self.sid, FILE_INBOX, fid): None})
+                continue
+            self.accept(fid, box[fid])
+        for fid in list(self.st["jobs"]):                 # pedido removido pela central = envio cancelado
+            if fid not in box:
+                self.finish(fid, "erro", FileError("cancelado", "envio cancelado pela central"))
+
+    def check(self, fid, d):
+        """Pedido validado (cópia só com os campos do contrato) ou FileError (nada é baixado)."""
+        if not isinstance(d, dict) or not all(k in d for k in FILE_FIELDS):
+            raise FileError("pedido_invalido", "pedido incompleto")
+        ok = (isinstance(d["name"], str) and is_int(d["size"]) and isinstance(d["sha256"], str)
+              and FILE_SHA_RE.match(d["sha256"]) and isinstance(d["token"], str) and FILE_TOKEN_RE.match(d["token"])
+              and isinstance(d["overwrite"], bool) and is_int(d["expires_at"]) and is_num(d["created_at"])
+              and isinstance(d["sig"], str) and FILE_SIG_RE.match(d["sig"]) and isinstance(d["url"], str)
+              and (d.get("dest_path") is None or isinstance(d["dest_path"], str)))
+        if not ok:
+            raise FileError("pedido_invalido", "pedido com campo inválido")
+        if not file_name_ok(d["name"]):
+            raise FileError("pedido_invalido", "nome de arquivo inválido: %s" % clip(d["name"], 120))
+        if not 1 <= d["size"] <= FILE_MAX:
+            raise FileError("tamanho", "tamanho fora do limite (máximo %d MB)" % (FILE_MAX >> 20))
+        if not file_url_ok(d["url"], fid, self.allowed_relays()):
+            raise FileError("url_nao_permitida", "endereço do depósito fora da lista de relays deste agente")
+        if d.get("dest_path") is not None and not file_dest_ok(d["dest_path"]):
+            raise FileError("destino_invalido", "destino inválido para este servidor: %s" % clip(d["dest_path"], 300))
+        now_ms = self.live.server_now() * 1000
+        if d["expires_at"] <= now_ms:
+            raise FileError("expirado", "pedido expirado antes de ser recebido")
+        if d["expires_at"] - d["created_at"] > FILE_VALID_MAX:
+            raise FileError("pedido_invalido", "validade maior que 30 dias")
+        key = read_catkey(self.key_path)
+        if key is None:
+            raise FileError("sem_chave", "o agente não tem a chave do catálogo (no servidor: --catalogo-chave)")
+        if not hmac.compare_digest(file_sig(key, self.sid, fid, d), d["sig"]):
+            raise FileError("assinatura", "assinatura do pedido não confere com a chave do catálogo deste agente")
+        return {k: d[k] for k in FILE_FIELDS + ("dest_path",) if k in d and k != "sig"}
+
+    def allowed_relays(self):
+        acfg = getattr(self.cloud, "acfg", None)
+        v = acfg.get("sql", "relays") if acfg is not None else None
+        return sql_relays_parse(v) or sql_relays_parse(SQL_RELAYS_DEFAULT)
+
+    def accept(self, fid, d):
+        try:
+            job = self.check(fid, d)
+        except FileError as e:
+            self.say("Arquivos: pedido %s recusado (%s: %s)" % (fid, e.code, e))
+            self.finish(fid, "expirado" if e.code == "expirado" else "recusado", e,
+                        job=d if isinstance(d, dict) else None)
+            return
+        job["accepted_at"] = time.time()
+        self.st["jobs"][fid] = job
+        self.save()
+        self.say("Arquivos: recebido o pedido %s (%s, %d bytes, sha256 %s%s)" % (
+            fid, job["name"], job["size"], job["sha256"], ", destino " + job["dest_path"] if job.get("dest_path") else ""))
+        self.send_status(fid, "recebido", 0)
+
+    # ---- resultado no Firebase ----
+    def status_doc(self, state, nbytes, err=None, job=None, saved=None, backup=None):
+        doc = {"state": state, "updated_at": {".sv": "timestamp"}, "agent_version": VERSION, "bytes": int(nbytes)}
+        if saved:
+            doc["saved_path"] = clip(saved, 400)
+        if job and isinstance(job.get("dest_path"), str):
+            doc["dest_path"] = clip(job["dest_path"], 400)
+        if backup:
+            doc["backup_path"] = clip(backup, 400)
+        if err is not None:
+            doc["error_code"], doc["error"] = err.code, clip(str(err), 500)
+        return doc
+
+    def send_status(self, fid, state, nbytes, err=None):
+        """Progresso (melhor esforço: falha é ignorada, o resultado final é reenviado até confirmar)."""
+        doc = self.status_doc(state, nbytes, err, self.st["jobs"].get(fid))
+        with contextlib.suppress(CloudError):
+            self.live.patch("", {"file_status/%s/%s" % (self.sid, fid): doc})
+
+    def finish(self, fid, state, err=None, job=None, saved=None, backup=None, nbytes=0):
+        job = self.st["jobs"].pop(fid, None) or job
+        self.retry.pop(fid, None)
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(self.part_dir, fid + ".part"))
+        doc = self.status_doc(state, nbytes, err, job, saved, backup)
+        self.st["done"][fid] = {"at": time.time(), "state": state, "doc": doc}
+        self.save()
+        name = job.get("name") if isinstance(job, dict) else None
+        self.say("Arquivos: %s %s%s%s" % (fid, state, " (%s)" % name if isinstance(name, str) else "",
+                                          ": %s %s" % (err.code, err) if err is not None else ""))
+        self.flush_one(fid)
+
+    def flush_one(self, fid):
+        d = self.st["done"].get(fid)
+        if not d or "doc" not in d:
+            return True
+        try:
+            self.live.patch("", {"file_status/%s/%s" % (self.sid, fid): d["doc"],
+                                 "db_requests/%s/%s/%s" % (self.sid, FILE_INBOX, fid): None})
+        except CloudError:
+            self.flush_next = time.time() + FILE_RETRY
+            return False
+        d.pop("doc", None)
+        self.save()
+        return True
+
+    def flush(self):
+        for fid in sorted(self.st["done"]):
+            if not self.flush_one(fid):
+                break
+
+    # ---- download ----
+    def work(self):
+        jobs = sorted(self.st["jobs"].items(), key=lambda x: (x[1].get("accepted_at", 0), x[0]))
+        if not jobs:
+            return 60
+        now, wait = time.time(), 60.0
+        for fid, job in jobs:
+            fails, at = self.retry.get(fid, (0, 0.0))
+            if at > now:
+                wait = min(wait, at - now)
+                continue
+            try:
+                self.download(fid, job)
+            except FileError as e:
+                if e.final or job.get("expires_at", 0) <= self.live.server_now() * 1000:
+                    self.finish(fid, "expirado" if e.code == "expirado" or not e.final else "erro",
+                                e if e.final else FileError("expirado", "pedido expirou sem conseguir baixar (%s)" % e),
+                                nbytes=self.part_size(fid))
+                else:
+                    fails += 1
+                    self.retry[fid] = (fails, time.time() + min(FILE_RETRY_MAX, FILE_RETRY * 2 ** (fails - 1)))
+                    self.say("Arquivos: %s falhou (%s); nova tentativa em %d s" % (
+                        fid, e, self.retry[fid][1] - time.time()))
+                    self.send_status(fid, "baixando", self.part_size(fid), e)
+            return 0.2                                    # um por vez; volta logo para o próximo
+        return wait
+
+    def part_size(self, fid):
+        try:
+            return os.path.getsize(os.path.join(self.part_dir, fid + ".part"))
+        except OSError:
+            return 0
+
+    def rate(self):
+        """Limite de banda em bytes/s (agent_config files.max_kbps em kbit/s; 0 = sem limite)."""
+        acfg = getattr(self.cloud, "acfg", None)
+        v = acfg.get("files", "max_kbps", 0) if acfg is not None else 0
+        return v * 125 if is_int(v) and v > 0 else 0
+
+    def download(self, fid, job):
+        if job["expires_at"] <= self.live.server_now() * 1000:
+            raise FileError("expirado", "pedido expirou antes de terminar o download")
+        size = job["size"]
+        os.makedirs(self.part_dir, mode=0o700, exist_ok=True)
+        part = os.path.join(self.part_dir, fid + ".part")
+        have = self.part_size(fid)
+        if have > size:
+            os.remove(part)
+            have = 0
+        free = shutil.disk_usage(self.dir).free
+        if free < 2 * size + FILE_FREE_MARGIN - have:
+            raise FileError("espaco_insuficiente", "espaço livre insuficiente em %s (%d MB livres; precisa de %d MB)" % (
+                self.dir, free >> 20, (2 * size + FILE_FREE_MARGIN - have) >> 20))
+        h = hashlib.sha256()
+        if have:
+            with open(part, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+        if have < size:
+            have, h = self.fetch(fid, job, part, have, h)
+        self.send_status(fid, "conferindo", have)
+        if have != size or h.hexdigest() != job["sha256"]:
+            with contextlib.suppress(OSError):
+                os.remove(part)
+            if not job.get("sha_retry"):                  # baixa do zero uma vez antes de desistir
+                job["sha_retry"] = 1
+                self.save()
+                raise FileError("sha256", "o arquivo baixado não confere com o SHA-256 do pedido", final=False)
+            raise FileError("sha256", "o arquivo baixado não confere com o SHA-256 do pedido (2 tentativas)")
+        saved = self.store(fid, job, part)
+        if not job.get("dest_path"):
+            self.finish(fid, "gravado", job=job, saved=saved, nbytes=have)
+            return
+        try:
+            backup = self.install(fid, saved, job)
+        except FileError as e:
+            self.finish(fid, "erro", e, job=job, saved=saved, nbytes=have)
+            return
+        self.finish(fid, "instalado", job=job, saved=saved, backup=backup, nbytes=have)
+
+    def fetch(self, fid, job, part, have, h):
+        """Baixa a partir de `have` (Range). Devolve (bytes no .part, sha256 acumulado). Falha de rede = não final."""
+        headers = {"Authorization": "C2File " + job["token"], "User-Agent": "usage-monitor/" + VERSION}
+        if have:
+            headers["Range"] = "bytes=%d-" % have
+        try:
+            resp = file_opener().open(urllib.request.Request(job["url"], headers=headers), timeout=FILE_TIMEOUT)
+        except urllib.error.HTTPError as e:
+            if e.code == 416:                             # .part maior/estranho para o depósito: recomeça
+                with contextlib.suppress(OSError):
+                    os.remove(part)
+                raise FileError("download", "o depósito recusou a retomada (HTTP 416): recomeça do zero", final=False)
+            if e.code in (401, 403, 404, 410):
+                raise FileError("download", "o depósito recusou o arquivo (HTTP %d: cancelado, expirado ou sem "
+                                            "permissão)" % e.code)
+            raise FileError("download", "o depósito respondeu HTTP %d" % e.code, final=False)
+        except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError) as e:
+            raise FileError("download", "sem conexão com o depósito (%s)" % (
+                str(getattr(e, "reason", "") or e)[:160] or type(e).__name__), final=False)
+        size, rate = job["size"], self.rate()
+        try:
+            status = resp.getcode()
+            if status == 200 and have:                    # o depósito ignorou o Range: recomeça
+                have, h = 0, hashlib.sha256()
+            elif status not in (200, 206):
+                raise FileError("download", "o depósito respondeu HTTP %d" % status, final=False)
+            t0 = last = time.monotonic()
+            got = 0
+            with open(part, "ab" if have else "wb") as f:
+                while not self.stop_ev.is_set():
+                    chunk = resp.read(FILE_CHUNK)
+                    if not chunk:
+                        break
+                    if have + len(chunk) > size:
+                        raise FileError("tamanho", "o depósito enviou mais bytes que o tamanho do pedido")
+                    f.write(chunk)
+                    h.update(chunk)
+                    have += len(chunk)
+                    got += len(chunk)
+                    if rate:
+                        delay = got / rate - (time.monotonic() - t0)
+                        if delay > 0:
+                            self.stop_ev.wait(delay)
+                    if time.monotonic() - last >= FILE_PROGRESS:
+                        last = time.monotonic()
+                        f.flush()
+                        self.send_status(fid, "baixando", have)
+        except (OSError, http.client.HTTPException) as e:
+            raise FileError("download", "download interrompido (%s)" % (str(e)[:160] or type(e).__name__), final=False)
+        finally:
+            with contextlib.suppress(Exception):
+                resp.close()
+        if have < size:
+            raise FileError("download", "download interrompido em %d de %d bytes" % (have, size), final=False)
+        return have, h
+
+    def store(self, fid, job, part):
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        dst = os.path.join(self.dir, "%s_%s" % (stamp, job["name"]))
+        if os.path.lexists(dst):
+            dst = os.path.join(self.dir, "%s_%s_%s" % (stamp, fid[:8], job["name"]))
+        try:
+            os.replace(part, dst)
+        except OSError as e:
+            raise FileError("gravacao", "não consegui gravar em %s (%s)" % (dst, e))
+        return dst
+
+    def install(self, fid, saved, job):
+        """Copia para dest_path: troca atômica (temporário na mesma pasta + os.replace), com .bak do anterior."""
+        dest = job["dest_path"]
+        parent = os.path.dirname(dest)
+        if not os.path.isdir(parent):
+            raise FileError("destino_invalido", "a pasta de destino não existe: %s" % parent)
+        exists = os.path.lexists(dest)
+        if exists and os.path.isdir(dest):
+            raise FileError("destino_invalido", "o destino é uma pasta: %s" % dest)
+        if exists and not job["overwrite"]:
+            raise FileError("destino_existe", "o destino já existe e o envio não permite sobrescrever: %s" % dest)
+        tmp = os.path.join(parent, ".%s.c2tmp-%s" % (os.path.basename(dest), fid[:8]))
+        backup = None
+        try:
+            shutil.copyfile(saved, tmp)
+            if exists:
+                with contextlib.suppress(OSError):
+                    shutil.copymode(dest, tmp)
+                backup = "%s.bak-%s" % (dest, time.strftime("%Y%m%d-%H%M%S"))
+                shutil.copy2(dest, backup)
+            os.replace(tmp, dest)
+        except OSError as e:
+            for p in (tmp, backup):
+                if p:
+                    with contextlib.suppress(OSError):
+                        os.remove(p)
+            if IS_WINDOWS and (isinstance(e, PermissionError) or getattr(e, "winerror", None) in (5, 32, 33)):
+                raise FileError("arquivo_em_uso", "o destino está em uso (feche o programa e envie de novo): %s" % dest)
+            raise FileError("gravacao", "não consegui gravar no destino %s (%s)" % (dest, e))
+        return backup
+
+    # ---- limpeza ----
+    def clean(self):
+        """Recebidos: apaga com mais de FILE_KEEP_DAYS dias e o excesso acima de FILE_KEEP_BYTES (mais antigos
+        primeiro); .part sem download aceito; lembranças antigas de pedidos concluídos."""
+        now = time.time()
+        self.st["cleaned_at"] = now
+        files = []
+        with contextlib.suppress(OSError):
+            for e in os.scandir(self.dir):
+                if e.is_file(follow_symlinks=False) and not e.name.startswith("."):
+                    s = e.stat(follow_symlinks=False)
+                    files.append((s.st_mtime, s.st_size, e.path))
+        files.sort()
+        total = sum(x[1] for x in files)
+        for mt, sz, p in files:
+            if mt < now - FILE_KEEP_DAYS * 86400 or total > FILE_KEEP_BYTES:
+                with contextlib.suppress(OSError):
+                    os.remove(p)
+                    total -= sz
+        with contextlib.suppress(OSError):
+            for e in os.scandir(self.part_dir):
+                fid = e.name[:-5] if e.name.endswith(".part") else None
+                if fid not in self.st["jobs"] and e.stat(follow_symlinks=False).st_mtime < now - FILE_PART_STALE:
+                    with contextlib.suppress(OSError):
+                        os.remove(e.path)
+        for fid in [f for f, d in self.st["done"].items()
+                    if "doc" not in d and not (is_num(d.get("at")) and d["at"] > now - FILE_DONE_KEEP)]:
+            del self.st["done"][fid]
+        self.save()
+
+
+# --------------------------------------------------------------------------
 # Autoatualização: procura versão nova do programa, troca o arquivo e reinicia
 # --------------------------------------------------------------------------
 # Mesma origem do instalar.sh (USAGE_MONITOR_URL sobrescreve, como lá; file:// serve para testes)
@@ -14478,6 +15015,7 @@ def main():
             mon.sysev = SysEvents(cloud, mon.db, out=mon.say)  # eventos do sistema: mesma conexão do DbAgent
             mon.sql = SqlEditor(cloud, mon.db, out=mon.say)    # editor SQL: pedidos pela mesma escuta do DbAgent
             mon.prof = Profiler(cloud, mon.db, out=mon.say)    # profile do banco: idem
+            mon.files = FileReceiver(cloud, mon.db, out=mon.say)   # arquivos da central: idem (ou lê sozinho)
             # filas ERP (v2.18): uma leitura por janela, com a configuração do DbAgent e os limites da central
             mon.queues = cloud.queues = QueueReader(mon.db, mon.next_boundary, cloud.acfg, out=mon.say,
                                                     path=os.path.join(cloud.dir, QUEUE_SEEN_FILE))
@@ -14485,7 +15023,7 @@ def main():
     mon.updater = Updater(os.path.abspath(__file__), ident.sync_cfg(), out=mon.say, on_restart=mon.stop_ev.set)
     mon.updater.acfg = cloud.acfg                         # intervalo e janela da autoatualização (central)
     if sync is not None:
-        sync.updater, sync.db = mon.updater, mon.db       # avisos da central (signals/<sid>) acordam os dois
+        sync.updater, sync.db, sync.files = mon.updater, mon.db, mon.files   # avisos da central (signals/<sid>)
         sync.on_restart = lambda: mon.updater.request_restart("Coleta alterada pela central")
         sync.on_rename = lambda: mon.say("Renomeado pela central: empresa %s, servidor %s" % (
             ident.company or "-", ident.name or "-"))
@@ -14521,6 +15059,10 @@ def main():
             print("Profile do banco (pedido pela central): %s." % (
                 "disponível junto com o acesso ao banco" if c["db_profiler"] and c["db_access"]
                 else "DESLIGADO (sync.%s)" % ("db_profiler" if not c["db_profiler"] else "db_access")))
+        if mon.files is not None:
+            mon.files.start()
+            print("Arquivos enviados pela central: %s." % (
+                "recebe em %s" % mon.files.dir if ident.sync_cfg()["file_receive"] else "DESLIGADO (sync.file_receive)"))
         if mon.queues is not None:
             mon.queues.start()
             print("Filas ERP (admin.monitor_filas): %s." % ("lidas a cada janela junto com o acesso ao banco"
