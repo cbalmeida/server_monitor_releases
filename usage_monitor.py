@@ -105,7 +105,7 @@ except ImportError:
 from array import array
 from xml.sax.saxutils import escape as xml_escape
 
-VERSION = "2.24.1"
+VERSION = "2.24.2"
 # Projeto Firebase da C2 (padrão do --firebase-setup). Não são segredos: a URL só identifica o banco e
 # a chave só identifica o projeto (restrita às APIs de login); o acesso é decidido pelas regras.
 FIREBASE_DB_URL = "https://c2-server-monitor-default-rtdb.firebaseio.com"
@@ -12954,11 +12954,34 @@ def mesh_admin():
         return True
 
 
+# Nomes do ambiente do Windows na grafia original. O os.environ do Windows guarda as chaves em MAIÚSCULAS e o
+# supervisor (--service) repassa esse dict ao coletor; o MeshAgent (JavaScript, process.env sensível a maiúsculas) lia
+# process.env.ProgramFiles = undefined e falhava com "Unable to create dir: undefined\Mesh Agent" (v2.24.2).
+WIN_ENV_NAMES = ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "ProgramData", "CommonProgramFiles",
+                 "CommonProgramFiles(x86)", "CommonProgramW6432", "SystemRoot", "SystemDrive", "windir", "ComSpec",
+                 "Path", "PATHEXT", "TEMP", "TMP", "APPDATA", "LOCALAPPDATA", "ALLUSERSPROFILE", "PUBLIC",
+                 "USERPROFILE", "USERNAME", "USERDOMAIN", "COMPUTERNAME", "HOMEDRIVE", "HOMEPATH", "OS",
+                 "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS")
+
+
+def win_child_env(environ=None):
+    """Ambiente para um processo filho no Windows com os nomes conhecidos na grafia original (sem duplicar chaves)."""
+    src = dict(os.environ if environ is None else environ)
+    canon = {n.upper(): n for n in WIN_ENV_NAMES}
+    env = {}
+    for k, v in src.items():
+        env[canon.get(k.upper(), k)] = v
+    if "ProgramFiles" not in env:                       # serviço com ambiente mínimo: padrão do Windows
+        env["ProgramFiles"] = env.get("ProgramW6432") or (env.get("SystemDrive", "C:") + "\\Program Files")
+    return env
+
+
 def mesh_exec(args, timeout=MESH_INFO_TIMEOUT, cwd=None):
     """Executável do MeshAgent / sc.exe / systemctl sem shell: (código, saída). 127 = ausente ou tempo esgotado."""
     try:
         p = subprocess.run(list(args), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                           universal_newlines=True, timeout=timeout, cwd=cwd, errors="replace")
+                           universal_newlines=True, timeout=timeout, cwd=cwd, errors="replace",
+                           env=win_child_env() if IS_WINDOWS else None)
         return p.returncode, (p.stdout or "").strip()
     except (OSError, subprocess.SubprocessError) as e:
         return 127, str(e)
