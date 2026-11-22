@@ -105,7 +105,7 @@ except ImportError:
 from array import array
 from xml.sax.saxutils import escape as xml_escape
 
-VERSION = "2.24.2"
+VERSION = "2.25.0"
 # Projeto Firebase da C2 (padrão do --firebase-setup). Não são segredos: a URL só identifica o banco e
 # a chave só identifica o projeto (restrita às APIs de login); o acesso é decidido pelas regras.
 FIREBASE_DB_URL = "https://c2-server-monitor-default-rtdb.firebaseio.com"
@@ -3193,6 +3193,7 @@ SYNC_DEFAULTS = {
     "prof_days": 180,            # dias máximos de um profile no Firebase/cópia local
     "file_receive": True,        # v2.19: recebe arquivos enviados pela central (recebidos/ e destino opcional)
     "remote_access": True,       # v2.24: acesso remoto pelo MeshCentral conforme a central (false = não mexe no MeshAgent)
+    "signals_stream": True,      # v2.25: escuta em tempo real de signals/<sid> (avisos em ~1 s; false = só após o heartbeat)
 }
 HIST_MIN_GAP = 600               # mudança de estado só antecipa o histórico se o último envio tiver > 10 min
 HB_POLL = 5                      # s entre verificações da thread do heartbeat
@@ -4632,6 +4633,8 @@ class SyncManager:
     Avisos da central (v2.6.1): depois de cada heartbeat, a mesma thread lê signals/<sid> (um GET pequeno, sem
     disco; falha ignorada, sem mexer no backoff do heartbeat). release maior que VERSION acorda o Updater;
     config_at/catalog_at diferentes do último visto acordam o DbAgent. A 1ª leitura só registra os valores.
+    v2.25: a escuta SignalsListener (thread 'avisos', SSE em signals/<sid>, sync.signals_stream) aplica os mesmos
+    avisos em ~1 s pela mesma apply_signals; a leitura depois do heartbeat fica como garantia.
 
     Frequências da central (v2.11, AgentConfig em cloud.acfg): agent_config lido no 1º heartbeat, quando
     signals/<sid>/agent_config_at muda e a cada AGENT_CFG_REFRESH. eff() = configuração vigente na faixa de horário
@@ -4659,6 +4662,8 @@ class SyncManager:
         self.files = None                             # FileReceiver (v2.19): signals/<sid>/file_at
         self.mesh = None                              # MeshKeeper (v2.24): signals/<sid>/mesh_at
         self.signals_seen, self.signals_at = None, 0.0   # últimos valores lidos (None = ainda não leu) e quando
+        self.signals_lock = threading.Lock()          # a escuta (thread 'avisos') e o heartbeat aplicam os avisos
+        self.signals_listener = None                  # v2.25: escuta SSE de signals/<sid> (sync.signals_stream)
         self.acfg_next = 0.0                          # próxima leitura de agent_config (0 = na partida)
         self.hb_force = False                         # configuração nova: heartbeat já (anuncia interval/offline novos)
         self.on_restart = None                        # coleta mudou pela central: reinício controlado (ligado pelo main)
@@ -4677,6 +4682,9 @@ class SyncManager:
         if self.hb_thread is None and self.auto and self.cloud.live.configured():
             self.hb_thread = threading.Thread(target=self.hb_loop, name="sinal", daemon=True)
             self.hb_thread.start()
+            if self.cfg["signals_stream"] and self.signals_listener is None:
+                self.signals_listener = SignalsListener(self)
+                self.signals_listener.start()
 
     def hb_loop(self):
         """Thread do heartbeat: acorda a cada HB_POLL s; beat() decide se já é hora."""
@@ -4839,16 +4847,24 @@ class SyncManager:
         return changed
 
     def check_signals(self):
-        """Lê signals/<sid> e acorda quem precisa: Updater (release maior que VERSION, quando muda) e DbAgent
-        (config_at/catalog_at mudaram). Qualquer falha (rede, regras ainda sem o nó: 401/403) é ignorada."""
+        """Lê signals/<sid> depois do heartbeat (garantia da escuta em tempo real, v2.25) e aplica os avisos.
+        Qualquer falha (rede, regras ainda sem o nó: 401/403) é ignorada."""
         self.signals_at = time.time()
         try:
             doc = self.cloud.signals()
         except Exception:                             # nunca atrapalha o heartbeat
             return None
+        return self.apply_signals(doc)
+
+    def apply_signals(self, doc):
+        """Avisos da central (signals/<sid>, lidos pelo heartbeat ou pela escuta SignalsListener): acorda quem precisa
+        quando o valor muda em relação ao último visto. Updater (release maior que VERSION), DbAgent (config_at/
+        catalog_at), agent_config, renome, arquivos e MeshAgent. A 1ª leitura depois de iniciar só registra.
+        Devolve a lista do que foi acordado (None na 1ª leitura)."""
         doc = doc if isinstance(doc, dict) else {}
         cur = {k: doc.get(k) for k in SIGNAL_KEYS}
-        prev, self.signals_seen = self.signals_seen, cur
+        with self.signals_lock:
+            prev, self.signals_seen = self.signals_seen, cur
         if prev is None:
             return None                               # 1ª leitura depois de iniciar: só registra
         woke = []
@@ -5001,6 +5017,8 @@ class SyncManager:
         o 'monitor parado' é sempre o último a chegar."""
         self.stop_ev.set()
         self.ev.set()
+        if self.signals_listener is not None:
+            self.signals_listener.stop()
         for th in (self.thread, self.hb_thread):
             if th is not None and th is not threading.current_thread():
                 th.join(15)
@@ -5829,7 +5847,166 @@ def in_use_doc(rows):
     return out
 
 
-class DbAgent:
+class SseListen:
+    """Escuta em tempo real de um nó do RTDB pelo streaming REST (SSE, Accept: text/event-stream), extraída do
+    DbAgent na v2.25 para servir também à escuta de signals/<sid> (SignalsListener). Quem herda tem self.live
+    (LiveStatus), self.stop_ev e self.listen (Event: escuta ligada), self.resp (resposta aberta), self.sse
+    ({"state", "fails", "msg"}) e implementa sse_path() (nó escutado) e sse_data(event, path, data) (cada put/patch).
+    Reconecta com espera crescente (SSE_BACKOFF até SSE_BACKOFF_MAX), renova o token SSE_RENEW s antes de vencer,
+    trata auth_revoked/cancel e considera a conexão morta depois de SSE_TIMEOUT s sem nenhum byte (o Firebase manda
+    keep-alive a cada ~30 s). Proxy: o do urllib (variáveis https_proxy)."""
+
+    def close_stream(self):
+        """Fecha a escuta de outra thread: shutdown no socket acorda o recv bloqueado (close sozinho não)."""
+        r = self.resp
+        if r is not None:
+            with contextlib.suppress(Exception):
+                r.fp.raw._sock.shutdown(socket.SHUT_RDWR)
+            with contextlib.suppress(Exception):
+                r.close()
+
+    def sse_loop(self):
+        while not self.stop_ev.is_set():
+            if not self.listen.wait(1):
+                continue
+            try:
+                ok = self.sse_once()
+            except Exception as e:                        # nunca derruba a thread (ex.: segredo corrompido)
+                ok = self.sse_fail("erro interno: %s" % type(e).__name__)
+            if self.stop_ev.is_set():
+                break
+            if ok:
+                self.sse["fails"] = 0
+            else:
+                self.sse["fails"] += 1
+                self.stop_ev.wait(min(SSE_BACKOFF_MAX, SSE_BACKOFF * 2 ** (self.sse["fails"] - 1)))
+
+    def sse_fail(self, msg):
+        self.sse.update(state="erro", msg=msg[:120])
+        return False
+
+    def sse_once(self):
+        """Uma conexão de escuta. True = terminou normalmente (renovar token, servidor fechou); False = falha."""
+        try:
+            tok = self.live.token(min_valid=SSE_RENEW + 60)
+            url = "%s/%s.json?%s" % (self.live.db, self.sse_path(), urllib.parse.urlencode({"auth": tok}))
+            req = urllib.request.Request(url, headers={"Accept": "text/event-stream",
+                                                       "User-Agent": "usage-monitor/" + VERSION})
+            resp = urllib.request.urlopen(req, timeout=SSE_TIMEOUT)
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                self.live.id_token = None
+            return self.sse_fail("Firebase respondeu %d" % e.code)
+        except CloudError as e:
+            return self.sse_fail(str(e))
+        except (urllib.error.URLError, OSError) as e:
+            return self.sse_fail("sem conexão com o Firebase (%s)" % getattr(e, "reason", e))
+        exp = self.live.exp
+        self.live.note_date(resp.headers)
+        self.resp = resp
+        self.sse.update(state="ok", msg="")
+        buf, event, data = b"", None, []
+        try:
+            while not self.stop_ev.is_set() and self.listen.is_set():
+                chunk = resp.read1(65536)
+                if not chunk:
+                    return True                           # o servidor fechou: reconecta
+                buf += chunk
+                if len(buf) > SSE_MAX_BUF:
+                    return self.sse_fail("evento grande demais")
+                *lines, buf = buf.split(b"\n")
+                for line in lines:
+                    line = line.rstrip(b"\r")
+                    if line:
+                        if line.startswith(b"event:"):
+                            event = line[6:].strip().decode("utf-8", "replace")
+                        elif line.startswith(b"data:"):
+                            data.append(line[5:].strip())
+                        continue
+                    r = self.sse_event(event, b"\n".join(data))
+                    event, data = None, []
+                    if r is not None:
+                        return r
+                if exp - time.time() < SSE_RENEW:
+                    return True                           # token perto de vencer: reconecta com um novo
+            return True
+        except (OSError, http.client.HTTPException, ValueError) as e:
+            return self.sse_fail("escuta interrompida (%s)" % (str(e)[:80] or type(e).__name__))
+        finally:
+            self.resp = None
+            with contextlib.suppress(Exception):
+                resp.close()
+
+    def sse_event(self, event, data):
+        """None = continua; True = reconectar já; False = falha (espera antes de reconectar)."""
+        if event in ("put", "patch"):
+            d = json.loads(data.decode("utf-8"))
+            self.sse_data(event, d.get("path", "/"), d.get("data"))
+        elif event == "auth_revoked":
+            self.live.id_token = None
+            return True
+        elif event == "cancel":
+            return self.sse_fail("o Firebase cancelou a escuta (permissão)")
+        return None
+
+
+def sse_merge(doc, event, path, data):
+    """Aplica um evento put/patch do streaming do RTDB à cópia local do nó escutado e devolve o nó novo (put = troca
+    o valor em path; patch = troca cada filho de data abaixo de path; None apaga)."""
+    box = {"v": copy.deepcopy(doc)}
+    base = ["v"] + [p for p in (path or "/").split("/") if p]
+    pairs = list(data.items()) if event == "patch" and isinstance(data, dict) else [("", data)]
+    for rel, val in pairs:
+        ks = base + [p for p in str(rel).split("/") if p]
+        cur = box
+        for k in ks[:-1]:
+            if not isinstance(cur.get(k), dict):
+                cur[k] = {}
+            cur = cur[k]
+        if val is None:
+            cur.pop(ks[-1], None)
+        else:
+            cur[ks[-1]] = val
+    return box.get("v")
+
+
+class SignalsListener(SseListen):
+    """Avisos da central em tempo real (v2.25): escuta SSE de signals/<sid> (thread 'avisos', uma conexão persistente
+    que só trafega quando o nó muda, mais o keep-alive do Firebase). Cada put/patch atualiza a cópia local do nó e
+    passa por SyncManager.apply_signals, a mesma lógica da leitura depois do heartbeat (que continua como garantia).
+    Independe do acesso ao banco (o aviso de versão vale para todos); sync.signals_stream false desliga."""
+
+    def __init__(self, sync):
+        self.sync, self.live = sync, sync.cloud.live
+        self.sid = sync.cloud.ident.install_id
+        self.stop_ev, self.listen = threading.Event(), threading.Event()
+        self.resp = self.thread = None
+        self.sse = {"state": "", "fails": 0, "msg": ""}
+        self.doc = None                   # cópia local de signals/<sid> (refeita pelo put inicial de cada conexão)
+        self.events = 0
+
+    def start(self):
+        self.listen.set()
+        self.thread = threading.Thread(target=self.sse_loop, name="avisos", daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_ev.set()
+        self.listen.clear()
+        self.close_stream()
+        if self.thread is not None and self.thread is not threading.current_thread():
+            self.thread.join(5)
+
+    def sse_path(self):
+        return "signals/" + self.sid
+
+    def sse_data(self, event, path, data):
+        self.doc = sse_merge(self.doc, event, path, data)
+        self.events += 1
+        self.sync.apply_signals(self.doc)
+
+
+class DbAgent(SseListen):
     """Acesso remoto ao Postgres local. Duas threads, sem tocar na coleta nem no heartbeat:
 
     - 'banco': a cada DB_REFRESH lê db_config/{sid}/updated_at e db_catalog/{sid}/sig (o nó inteiro só quando
@@ -6433,99 +6610,12 @@ class DbAgent:
             except OSError:
                 pass
 
-    # ---- escuta (SSE) ----
-    def close_stream(self):
-        """Fecha a escuta de outra thread: shutdown no socket acorda o recv bloqueado (close sozinho não)."""
-        r = self.resp
-        if r is not None:
-            with contextlib.suppress(Exception):
-                r.fp.raw._sock.shutdown(socket.SHUT_RDWR)
-            with contextlib.suppress(Exception):
-                r.close()
+    # ---- escuta (SSE, SseListen) ----
+    def sse_path(self):
+        return "db_requests/" + self.sid
 
-    def sse_loop(self):
-        while not self.stop_ev.is_set():
-            if not self.listen.wait(1):
-                continue
-            try:
-                ok = self.sse_once()
-            except Exception as e:                        # nunca derruba a thread (ex.: segredo corrompido)
-                ok = self.sse_fail("erro interno: %s" % type(e).__name__)
-            if self.stop_ev.is_set():
-                break
-            if ok:
-                self.sse["fails"] = 0
-            else:
-                self.sse["fails"] += 1
-                self.stop_ev.wait(min(SSE_BACKOFF_MAX, SSE_BACKOFF * 2 ** (self.sse["fails"] - 1)))
-
-    def sse_fail(self, msg):
-        self.sse.update(state="erro", msg=msg[:120])
-        return False
-
-    def sse_once(self):
-        """Uma conexão de escuta. True = terminou normalmente (renovar token, servidor fechou); False = falha."""
-        try:
-            tok = self.live.token(min_valid=SSE_RENEW + 60)
-            url = "%s/db_requests/%s.json?%s" % (self.live.db, self.sid, urllib.parse.urlencode({"auth": tok}))
-            req = urllib.request.Request(url, headers={"Accept": "text/event-stream",
-                                                       "User-Agent": "usage-monitor/" + VERSION})
-            resp = urllib.request.urlopen(req, timeout=SSE_TIMEOUT)
-        except urllib.error.HTTPError as e:
-            if e.code == 401:
-                self.live.id_token = None
-            return self.sse_fail("Firebase respondeu %d" % e.code)
-        except CloudError as e:
-            return self.sse_fail(str(e))
-        except (urllib.error.URLError, OSError) as e:
-            return self.sse_fail("sem conexão com o Firebase (%s)" % getattr(e, "reason", e))
-        exp = self.live.exp
-        self.live.note_date(resp.headers)
-        self.resp = resp
-        self.sse.update(state="ok", msg="")
-        buf, event, data = b"", None, []
-        try:
-            while not self.stop_ev.is_set() and self.listen.is_set():
-                chunk = resp.read1(65536)
-                if not chunk:
-                    return True                           # o servidor fechou: reconecta
-                buf += chunk
-                if len(buf) > SSE_MAX_BUF:
-                    return self.sse_fail("evento grande demais")
-                *lines, buf = buf.split(b"\n")
-                for line in lines:
-                    line = line.rstrip(b"\r")
-                    if line:
-                        if line.startswith(b"event:"):
-                            event = line[6:].strip().decode("utf-8", "replace")
-                        elif line.startswith(b"data:"):
-                            data.append(line[5:].strip())
-                        continue
-                    r = self.sse_event(event, b"\n".join(data))
-                    event, data = None, []
-                    if r is not None:
-                        return r
-                if exp - time.time() < SSE_RENEW:
-                    return True                           # token perto de vencer: reconecta com um novo
-            return True
-        except (OSError, http.client.HTTPException, ValueError) as e:
-            return self.sse_fail("escuta interrompida (%s)" % (str(e)[:80] or type(e).__name__))
-        finally:
-            self.resp = None
-            with contextlib.suppress(Exception):
-                resp.close()
-
-    def sse_event(self, event, data):
-        """None = continua; True = reconectar já; False = falha (espera antes de reconectar)."""
-        if event in ("put", "patch"):
-            d = json.loads(data.decode("utf-8"))
-            self.q.put((event, d.get("path", "/"), d.get("data")))
-        elif event == "auth_revoked":
-            self.live.id_token = None
-            return True
-        elif event == "cancel":
-            return self.sse_fail("o Firebase cancelou a escuta (permissão)")
-        return None
+    def sse_data(self, event, path, data):
+        self.q.put((event, path, data))
 
 
 # --------------------------------------------------------------------------
@@ -12785,6 +12875,9 @@ MESH_DL_TIMEOUT = 60                   # s sem resposta do MeshCentral
 MESH_CMD_TIMEOUT = 300                 # s por -fullinstall/-fulluninstall
 MESH_INFO_TIMEOUT = 30                 # s por -nodeid/-info/sc/systemctl
 MESH_START_WAIT = 15                   # s esperando o serviço chegar a "rodando" depois de iniciar
+MESH_NODE_WAITS = (5, 15, 30, 60)      # s antes de cada leitura do nodeid depois de instalar (v2.25: o NodeId do
+                                       # registro pode ser o da instalação anterior até o MeshAgent novo conectar)
+MESH_CONFIRM_AFTER = 120               # s: ciclo extra depois de uma instalação, para confirmar o nodeid
 MESH_SWITCH_TAG = "c2-mesh-switch-v1"  # mesh_config/switch (interruptor geral)
 MESH_SERVER_TAG = "c2-mesh-v2"         # mesh_config/servers/{sid} (com url e meshid, cópia por servidor)
 MESH_WIN_SERVICE = "Mesh Agent"        # nome do serviço e da chave HKLM\SOFTWARE\Open Source\<nome> (agentcore.c)
@@ -13015,6 +13108,20 @@ def mesh_download(url, path, limit=MESH_DL_MAX):
     return n
 
 
+MESH_NAME_MAX = 64                     # caracteres do --agentName (o MeshAgent aceita < 255)
+
+
+def mesh_agent_name(name):
+    """Nome do dispositivo no MeshCentral (v2.25, `-fullinstall --agentName=...`, enviado pelo MeshAgent no lugar do
+    hostname): o nome amigável do servidor só com ASCII seguro. O MeshAgent monta o JSON com sprintf sem escapar e o
+    valor passa pela linha de comando do serviço: sem aspas, barras, '=', '%' nem controles; acentos viram a letra
+    base. Vazio = não passa (o MeshCentral usa o hostname)."""
+    t = unicodedata.normalize("NFKD", str(name or ""))
+    t = "".join(c for c in t if not unicodedata.combining(c))
+    t = re.sub(r"[^A-Za-z0-9 ._()-]", " ", t)
+    return " ".join(t.split())[:MESH_NAME_MAX].strip()
+
+
 class MeshLocal:
     """O MeshAgent desta máquina: tipo de download, serviço, executável, nodeid e versão (lidos localmente)."""
 
@@ -13071,13 +13178,21 @@ class MeshLocal:
                 return False, out
             time.sleep(1)
 
-    def nodeid(self):
-        """'node//<64 caracteres>' ou ''. Windows: valor NodeId da chave do serviço (gravado pelo próprio agente, já
-        com @ e $); sem ele, ou no Linux, '<executável> -nodeid' (hex do SHA-384, lido do .db ao lado)."""
-        if self.os == "windows":
-            v = reg_value(MESH_WIN_REG, "NodeId")
-            if MESH_NODE_RE.match(v):
-                return "node//" + v
+    def reg_nodeid(self):
+        """Windows: 'node//' + valor NodeId da chave do serviço (gravado pelo próprio MeshAgent quando conecta, já com
+        @ e $) ou ''. Pode sobrar da instalação anterior (-fulluninstall não apaga em todos os casos)."""
+        if self.os != "windows":
+            return ""
+        v = reg_value(MESH_WIN_REG, "NodeId")
+        return "node//" + v if MESH_NODE_RE.match(v) else ""
+
+    def nodeid(self, stale=""):
+        """'node//<64 caracteres>' ou ''. Windows: o NodeId do registro, salvo se for igual a `stale` (valor de antes
+        da última (re)instalação, v2.25); senão, ou no Linux, '<executável> -nodeid' (hex do SHA-384 da chave do
+        agente, lido do .db ao lado: a fonte de verdade)."""
+        v = self.reg_nodeid()
+        if v and v != stale:
+            return v
         if not os.path.isfile(self.exe):
             return ""
         rc, out = mesh_exec([self.exe, "-nodeid"], cwd=self.dir)
@@ -13118,6 +13233,7 @@ class MeshKeeper:
         self.plain = ""                       # meshid decifrado do documento do servidor (judge)
         self.sent, self.sent_at = None, 0.0   # último mesh_status confirmado (sem os carimbos)
         self.last = {}                        # último ciclo (para o --diagnostico e testes)
+        self.confirm_at = 0.0                 # v2.25: ciclo extra depois de instalar (confirma o nodeid)
         self.st = self.load()
 
     def say(self, s):
@@ -13129,7 +13245,8 @@ class MeshKeeper:
         d = read_json(self.path)
         d = d if isinstance(d, dict) else {}
         st = {"switch": None, "server": None, "revs": {"switch": {}, "server": {}}, "server_seen": False,
-              "switch_seen_on": False, "ours": False, "applied_reinstall": None, "installed_mid": "", "state": "", "changed_at": 0}
+              "switch_seen_on": False, "ours": False, "applied_reinstall": None, "installed_mid": "", "state": "", "changed_at": 0,
+              "stale_nodeid": ""}
         for k in ("switch", "server"):
             if isinstance(d.get(k), dict) and isinstance(d[k].get("enabled"), bool) and mesh_int(d[k].get("rev")):
                 st[k] = d[k]
@@ -13142,7 +13259,7 @@ class MeshKeeper:
             st["switch_seen_on"] = True       # mesh.json da 2.24.0: o switch aceito já estava ligado
         if mesh_int(d.get("applied_reinstall")):
             st["applied_reinstall"] = d["applied_reinstall"]
-        for k in ("installed_mid", "state"):
+        for k in ("installed_mid", "state", "stale_nodeid"):
             st[k] = d[k] if isinstance(d.get(k), str) else ""
         st["changed_at"] = d["changed_at"] if mesh_int(d.get("changed_at")) else 0
         return st
@@ -13194,6 +13311,11 @@ class MeshKeeper:
             self.say("Acesso remoto: não leu a configuração da central (%s)" % e)
             return MESH_RETRY
         self.cycle(g, s)
+        if self.confirm_at:
+            left = self.confirm_at - time.time()
+            if left > 0:
+                return min(MESH_CHECK, left)          # depois de instalar: ciclo extra para confirmar o nodeid
+            self.confirm_at = 0.0
         return MESH_CHECK
 
     # ---- documentos da central ----
@@ -13350,6 +13472,9 @@ class MeshKeeper:
 
     def install(self, loc, url, meshid, mid):
         self.status_now(loc, "instalando", True)
+        old = loc.reg_nodeid()
+        if old:                                          # o que sobrou de uma instalação anterior (manual ou nossa)
+            self.st["stale_nodeid"] = old
         self.say("Acesso remoto: baixando e instalando o MeshAgent (tipo %d)" % loc.type)
         base = url.rstrip("/")
         q = urllib.parse.quote(meshid, safe="@")         # o $ vai como %24
@@ -13373,6 +13498,9 @@ class MeshKeeper:
                     if b"MeshID=" not in fh.read():
                         raise MeshError("download", "configuração do grupo (.msh) inválida")
                 cmd = [exe, "-fullinstall", "--copy-msh=1"]
+            name = mesh_agent_name(self.ident.name)
+            if name:                                      # nome do servidor da C2 no MeshCentral, não o hostname
+                cmd.append("--agentName=" + name)
             rc, out = mesh_exec(cmd, timeout=MESH_CMD_TIMEOUT, cwd=self.tmp)
         finally:
             shutil.rmtree(self.tmp, ignore_errors=True)
@@ -13384,9 +13512,39 @@ class MeshKeeper:
         self.st.update(ours=True, installed_mid=mid)
         self.save()
         self.say("Acesso remoto: MeshAgent instalado%s" % (" e rodando" if f["running"] else ""))
+        self.confirm_at = time.time() + MESH_CONFIRM_AFTER
+        self.confirm_nodeid(loc)
+
+    def confirm_nodeid(self, loc):
+        """Depois de (re)instalar: o nodeid novo só vale com o serviço rodando; lê com tentativas espaçadas
+        (MESH_NODE_WAITS), sem aceitar o NodeId do registro que sobrou da instalação anterior (Baby Rio, v2.25)."""
+        for wait in MESH_NODE_WAITS:
+            if self.stop_ev.wait(wait):
+                return ""
+            if not loc.service_state()[1]:
+                continue
+            nid = self.read_nodeid(loc)
+            if nid:
+                return nid
+        return ""
+
+    def read_nodeid(self, loc):
+        """nodeid atual sem o valor velho do registro (st.stale_nodeid). Registro diferente do velho = o MeshAgent
+        novo já gravou: o velho deixa de valer. '-nodeid' igual ao velho = era mesmo o mesmo agente."""
+        stale = self.st["stale_nodeid"]
+        nid = loc.nodeid(stale)
+        reg = loc.reg_nodeid() if stale else ""
+        if stale and ((reg and reg != stale) or nid == stale):
+            self.st["stale_nodeid"] = ""
+            self.save()
+        return nid
 
     def uninstall(self, loc):
         self.status_now(loc, "desinstalando", False)
+        old = loc.reg_nodeid()
+        if old:                                          # se o registro sobrar, a próxima instalação não o aceita
+            self.st["stale_nodeid"] = old
+            self.save()
         out, rc = "", 0
         if os.path.isfile(loc.exe):
             rc, out = mesh_exec([loc.exe, "-fulluninstall"], timeout=MESH_CMD_TIMEOUT, cwd=self.tmp_cwd())
@@ -13449,7 +13607,7 @@ class MeshKeeper:
         if loc.os and not why:
             doc["service"] = loc.service
         if not light and f["installed"]:
-            nid = loc.nodeid()
+            nid = self.read_nodeid(loc)                   # todo ciclo: nodeid mudou = mesh_status regravado
             if nid:
                 doc["nodeid"] = nid
             elif err is None and f["running"]:
@@ -13482,6 +13640,7 @@ def mesh_report(ident, out=print):
     cfg = ident.sync_cfg()
     loc = MeshLocal()
     why = loc.unsupported()
+    st = read_json(os.path.join(ident.base, SYNC_DIR, MESH_FILE))
     out("Acesso remoto (MeshCentral): %s | hosts permitidos: %s" % (
         "ligado conforme a central" if cfg["remote_access"] else "DESLIGADO (sync.remote_access)", ", ".join(MESH_HOSTS)))
     if why:
@@ -13492,8 +13651,8 @@ def mesh_report(ident, out=print):
             loc.type, loc.os, loc.arch, loc.service, "rodando" if f["running"] else "existe, parado" if f["service"]
             else "não existe", loc.exe, "existe" if f["exe"] else "não existe", "sim" if mesh_admin() else "NÃO"))
         if f["installed"]:
-            out("  nodeid: %s | versão: %s" % (loc.nodeid() or "não lido", loc.version() or "não lida"))
-    st = read_json(os.path.join(ident.base, SYNC_DIR, MESH_FILE))
+            stale = st.get("stale_nodeid") if isinstance(st, dict) and isinstance(st.get("stale_nodeid"), str) else ""
+            out("  nodeid: %s | versão: %s" % (loc.nodeid(stale) or "não lido", loc.version() or "não lida"))
     if isinstance(st, dict):
         g, s = st.get("switch") or {}, st.get("server") or {}
         out("  último estado: %s | geral rev %s (%s) | servidor rev %s (%s) | reinstalar aplicado: %s | %s" % (
