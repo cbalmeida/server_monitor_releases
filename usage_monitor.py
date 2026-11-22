@@ -105,7 +105,7 @@ except ImportError:
 from array import array
 from xml.sax.saxutils import escape as xml_escape
 
-VERSION = "2.23.0"
+VERSION = "2.24.0"
 # Projeto Firebase da C2 (padrão do --firebase-setup). Não são segredos: a URL só identifica o banco e
 # a chave só identifica o projeto (restrita às APIs de login); o acesso é decidido pelas regras.
 FIREBASE_DB_URL = "https://c2-server-monitor-default-rtdb.firebaseio.com"
@@ -1688,6 +1688,7 @@ class Monitor:
         self.sql = None                 # SqlEditor (editor SQL remoto, v2.12), junto com o DbAgent
         self.queues = None              # QueueReader (filas ERP, v2.18), junto com o DbAgent
         self.files = None               # FileReceiver (arquivos enviados pela central, v2.19)
+        self.mesh = None                # MeshKeeper (acesso remoto pelo MeshCentral, v2.24)
 
     def say(self, s):
         if self.out:
@@ -2067,6 +2068,8 @@ class Monitor:
             self.prof.stop()
         if self.files is not None:
             self.files.stop()
+        if self.mesh is not None:
+            self.mesh.stop()
         if self.sql is not None:
             self.sql.stop()
         if self.db is not None:
@@ -3178,7 +3181,7 @@ SYNC_DEFAULTS = {
     "retention_slack_days": 7,   # folga da retenção local: reescreve o relatório só quando passa de
                                  # retention_local_days + isto (uma reescrita por semana, não por dia)
     "state_disk_interval": 600,  # s entre cópias do estado do envio (em RAM, /dev/shm) para o disco
-    "db_access": True,           # acesso remoto da central ao Postgres local (db_config/<sid> ou DB_DEFAULTS)
+    "db_access": True,           # acesso remoto da central ao Postgres local (db_config/<sid>, gravado pela central)
     "sys_events": True,          # eventos do sistema (admin.system_email -> sys_events; exige db_access)
     "sys_events_interval": 180,  # s entre leituras da tabela de e-mails do sistema (mínimo 60)
     "sys_events_retention_days": 30,   # dias de eventos do sistema no Firebase (poda diária pelo last_at)
@@ -3189,13 +3192,14 @@ SYNC_DEFAULTS = {
     "prof_keep": 20,             # sessões de profile mantidas (Firebase e cópia local)
     "prof_days": 180,            # dias máximos de um profile no Firebase/cópia local
     "file_receive": True,        # v2.19: recebe arquivos enviados pela central (recebidos/ e destino opcional)
+    "remote_access": True,       # v2.24: acesso remoto pelo MeshCentral conforme a central (false = não mexe no MeshAgent)
 }
 HIST_MIN_GAP = 600               # mudança de estado só antecipa o histórico se o último envio tiver > 10 min
 HB_POLL = 5                      # s entre verificações da thread do heartbeat
 HB_BACKOFF, HB_BACKOFF_MAX = 15, 60   # espera após falha do heartbeat: 15 s, 30 s, 60 s, 60 s...
 HB_SUFFIX = ".hb"                 # live_path(log) + HB_SUFFIX, em RAM (/dev/shm): último heartbeat / falhas (para o --view)
 SIGNAL_KEYS = ("release", "config_at", "catalog_at", "agent_config_at", "rename_at",
-               "file_at")        # avisos da central em signals/<sid> (v2.6.1; v2.11; v2.14; v2.19)
+               "file_at", "mesh_at")   # avisos da central em signals/<sid> (v2.6.1; v2.11; v2.14; v2.19; v2.24)
 RENAME_REFRESH = 6 * 3600        # s entre releituras de garantia de rename/<sid> (o aviso signals/<sid>/rename_at antecipa)
 RENAME_RETRY = 300               # s até tentar de novo uma leitura/confirmação de renome que falhou
 NAME_MAX = 80                    # empresa e nome do servidor: até 80 caracteres (--empresa/--nome, renome pela central)
@@ -3521,10 +3525,20 @@ class LiveStatus:
         except CloudError:
             cur = None
         if cur == uid:
+            self.drop_code(sid)
             return "já cadastrado"
         self._req("%s/owners/%s.json?print=silent&auth=%s" % (self.db, sid, urllib.parse.quote(self.token())),
                   json.dumps({"uid": uid, "code": code, "at": {".sv": "timestamp"}}).encode(), method="PUT")
+        self.drop_code(sid)
         return "cadastrado"
+
+    def drop_code(self, sid):
+        """v2.24: o código de cadastro só serve para criar owners/<sid>; depois o dono apaga a cópia (as regras só
+        deixam apagar). Falha (rede, regras antigas) é ignorada: fica como antes."""
+        try:
+            self.patch("owners/" + sid, {"code": None}, timeout=15)
+        except Exception:                             # nunca atrapalha a partida nem o cadastro
+            pass
 
     def patch(self, path, payload, timeout=30):
         for attempt in (1, 2):
@@ -4643,6 +4657,7 @@ class SyncManager:
         self.hb_lock = threading.Lock()               # um envio de heartbeat por vez (o final do stop por último)
         self.updater = self.db = None                 # avisados por signals/<sid> (ligados pelo main)
         self.files = None                             # FileReceiver (v2.19): signals/<sid>/file_at
+        self.mesh = None                              # MeshKeeper (v2.24): signals/<sid>/mesh_at
         self.signals_seen, self.signals_at = None, 0.0   # últimos valores lidos (None = ainda não leu) e quando
         self.acfg_next = 0.0                          # próxima leitura de agent_config (0 = na partida)
         self.hb_force = False                         # configuração nova: heartbeat já (anuncia interval/offline novos)
@@ -4854,6 +4869,9 @@ class SyncManager:
         if cur["file_at"] != prev["file_at"] and self.files is not None:
             self.files.wake()
             woke.append("files")
+        if cur["mesh_at"] != prev["mesh_at"] and self.mesh is not None:
+            self.mesh.wake()
+            woke.append("mesh")
         return woke
 
     def check_rename(self):
@@ -5031,8 +5049,26 @@ class SyncManager:
 CATKEY_FILE = "server_monitor.catkey"           # chave do catálogo (64 hex = 32 bytes), permissão 600
 DB_AUDIT_FILE = "server_monitor_db_audit.log"   # auditoria local: uma linha JSON por pedido (600)
 DB_SUFFIX = ".db"               # live_path(log) + DB_SUFFIX, em RAM: estado para o painel e pedidos em execução
-DB_DEFAULTS = {"host": "127.0.0.1", "port": 5432, "dbname": "afv", "user": "admin", "password": "admin",
-               "sslmode": "prefer"}  # conexão usada enquanto a central não grava db_config/{sid} (v2.7.1)
+# v2.24: sem conexão padrão no código (a credencial saiu do programa público). Sem db_config/{sid} o acesso fica
+# parado com db_status.config_source "sem_config"; a central grava a conexão com a senha cifrada (password_seal).
+DB_SEAL_AAD = "db_config:%s:password"   # aad do seal da senha (c2-seal-v1, chave do catálogo), docs/PROPOSTA_BANCO.md
+DB_DIAG = {"host": "127.0.0.1", "port": 5432}   # --diagnostico: só confere se há um PostgreSQL escutando (sem login)
+
+
+def db_cfg_open(cfg, key, sid):
+    """db_config/{sid} -> (configuração com a senha em claro só em memória, None) ou (None, (código, mensagem)).
+    Senha em `password` (claro, legado) ou `password_seal` (v2.24: seal com aad db_config:<sid>:password)."""
+    if "password_seal" not in cfg:
+        return dict(cfg), None
+    if key is None:
+        return None, ("sem_chave", "falta a chave do catálogo no servidor: a senha cifrada do db_config não abre"
+                                   " (--catalogo-chave)")
+    pw = unseal(key, DB_SEAL_AAD % sid, cfg["password_seal"])
+    if pw is None:
+        return None, ("senha_selada", "a senha cifrada do db_config não confere com a chave do catálogo deste servidor")
+    out = {k: v for k, v in cfg.items() if k != "password_seal"}
+    out["password"] = pw
+    return out, None
 DB_REFRESH = 600                # s entre verificações de db_config/updated_at e db_catalog/sig
 DB_RETRY = 60                   # s até tentar de novo uma leitura do Firebase que falhou
 DB_KEY_CHECK = 5                # s entre verificações (stat) do arquivo da chave (tecla k no --view, --catalogo-chave)
@@ -5077,7 +5113,7 @@ APK_RE = re.compile(r"^c2tecnologia\.([a-z0-9]{1,32})_([0-9]{1,12})\.apk$", re.I
 APK_SUBDIR = ("Bases", "E1", "installAndroid")      # <DIR_AFV_LOCAL>/Bases/E1/installAndroid (SocketServer)
 DB_ERROR_CODES = ("desligado", "sem_chave", "catalogo_invalido", "operacao_desconhecida", "parametro_invalido",
                   "expirado", "conexao", "autenticacao", "sql", "tempo_esgotado", "limite_linhas",
-                  "resposta_grande", "interno")
+                  "resposta_grande", "sem_config", "senha_selada", "interno")
 OP_TYPES = ("consulta", "alteracao", "lista_dinamica")
 DYN_MARK = "{sql}"              # lista_dinamica: lugar do SQL guardado no banco dentro do modelo
 DYN_MAX = 10000                 # tamanho máximo do SQL guardado no banco (caracteres)
@@ -5797,11 +5833,12 @@ class DbAgent:
     """Acesso remoto ao Postgres local. Duas threads, sem tocar na coleta nem no heartbeat:
 
     - 'banco': a cada DB_REFRESH lê db_config/{sid}/updated_at e db_catalog/{sid}/sig (o nó inteiro só quando
-      muda), verifica o catálogo (HMAC, versão que não regride), atende os pedidos recebidos pela escuta
+      muda; senha em claro ou cifrada em password_seal, aberta só em memória), verifica o catálogo (HMAC, versão
+      que não regride), atende os pedidos recebidos pela escuta
       (valida, executa, grava resposta + auditoria e remove o pedido num PATCH só), fecha a conexão com o
       Postgres ociosa e poda respostas (24 h) e auditoria (180 d) uma vez por dia;
-    - 'banco-escuta': SSE em db_requests/{sid} (enquanto o acesso está permitido; sem db_config/{sid} a
-      conexão usa DB_DEFAULTS e o db_status diz config_source "padrao"),
+    - 'banco-escuta': SSE em db_requests/{sid} (enquanto o acesso está permitido; sem db_config/{sid} não há
+      conexão — v2.24, sem credencial no código — e o db_status diz config_source "sem_config"),
       reconectando com espera crescente e renovando o token antes de vencer.
     Nada no disco no caminho regular: estado em memória e em RAM (/dev/shm); no disco só a linha da
     auditoria local de cada pedido, a versão do catálogo quando sobe e a cópia do catálogo verificado
@@ -5820,6 +5857,7 @@ class DbAgent:
         self.enabled = None               # sync.db_access
         self.configured = False           # acesso ativo (desligado: só se existe db_config/{sid})
         self.cfg, self.cfg_at = None, None
+        self.cfg_err = None               # (código, mensagem): sem db_config / senha cifrada que não abre
         self.key, self.key_mtime, self.key_checked = None, None, 0.0
         self.cat_raw, self.cat_sig, self.catalog, self.cat_error, self.cat_forced = None, None, None, "", 0.0
         self.cat_path = os.path.join(cloud.base, SYNC_DIR, DB_CAT_FILE)
@@ -5940,18 +5978,21 @@ class DbAgent:
             return
         at = self.live.get("db_config/%s/updated_at" % sid)
         if at is not None and (at != self.cfg_at or self.cfg is None):
-            cfg = self.live.get("db_config/" + sid)
-            at = cfg.get("updated_at") if isinstance(cfg, dict) else None
+            raw = self.live.get("db_config/" + sid)
+            at = raw.get("updated_at") if isinstance(raw, dict) else None
             if at is not None:
-                self.cfg, self.cfg_at = cfg, at
+                self.cfg, self.cfg_err = db_cfg_open(raw, read_catkey(self.key_path), sid)
+                self.cfg_at = at
                 self.close_pg()
-                self.test_pending = True
-        if at is None and (self.cfg is None or self.cfg_at is not None):
-            # sem db_config/{sid}: conexão padrão (DB_DEFAULTS); db_config gravado pela central prevalece
-            self.cfg, self.cfg_at = dict(DB_DEFAULTS), None
+                self.conn_state, self.server_version = (None, "", ""), ""
+                self.test_pending = self.cfg is not None
+        if at is None and (self.cfg is not None or self.cfg_at is not None or self.cfg_err is None):
+            # sem db_config/{sid}: sem conexão (v2.24: nenhuma credencial padrão no código); a central precisa gravar
+            self.cfg, self.cfg_at = None, None
+            self.cfg_err = ("sem_config", "conexão com o banco ainda não configurada na central (db_config)")
             self.close_pg()
             self.conn_state, self.server_version = (None, "", ""), ""
-            self.test_pending = True
+            self.test_pending = False
         self.configured = True
         self.listen.set()
 
@@ -5967,6 +6008,9 @@ class DbAgent:
         changed = mt != self.key_mtime
         self.key_mtime = mt
         self.key = read_catkey(self.key_path) if mt is not None else None
+        if changed and self.cfg_err is not None and self.cfg_err[0] != "sem_config":
+            self.cfg_at = None                            # chave nova: tenta abrir a senha cifrada de novo
+            self.next_refresh = 0
         if changed and not force:
             self.catalog, self.cat_error = self.verify(self.cat_raw)
             with contextlib.suppress(CloudError):
@@ -6170,7 +6214,8 @@ class DbAgent:
             raise DbError("operacao_desconhecida", clip("operação desconhecida: %s" % op_id, 500))
         values = check_params(op, params)
         if self.cfg is None:
-            raise DbError("conexao", "conexão com o banco não configurada")
+            code, msg = self.cfg_err or ("sem_config", "conexão com o banco não configurada")
+            raise DbError(code, msg)
         self.mark(rid, True)
         self.send_patch({"db_responses/%s/%s" % (self.sid, rid): {"state": "processando",
                                                                   "started_at": {".sv": "timestamp"}}})
@@ -6288,10 +6333,12 @@ class DbAgent:
             doc["server_version"] = clip(self.server_version, 64)
         if self.catalog is not None:
             doc["catalog_version"] = self.catalog["version"]
-        if self.enabled and self.cfg is not None:
-            doc["config_source"] = "padrao" if self.cfg_at is None else "central"
+        if self.enabled and (self.cfg is not None or self.cfg_at is not None or self.cfg_err is not None):
+            doc["config_source"] = "central" if self.cfg_at is not None else "sem_config"
         if not self.enabled:
             code, msg = "desligado", "acesso ao banco desligado neste servidor (sync.db_access)"
+        elif self.cfg_err is not None:
+            code, msg = self.cfg_err
         elif ok_conn is False:
             pass
         elif self.key is None:
@@ -8686,7 +8733,7 @@ def ev_cods(s, cods):
 class SysEvents:
     """Thread 'eventos': lê admin.system_email (só SELECT, transação READ ONLY com statement_timeout) a cada
     sync.sys_events_interval e publica eventos lógicos em sys_events/{sid} (+ sys_events_detail e
-    sys_events_state). Usa a conexão do DbAgent (db_config/{sid} ou DB_DEFAULTS), mas com o próprio PgConn,
+    sys_events_state). Usa a conexão do DbAgent (db_config/{sid}), mas com o próprio PgConn,
     aberto e fechado a cada ciclo. Nunca toca na coleta nem no heartbeat; falha de banco/rede = backoff próprio.
 
     Estado em SYNC_DIR/sys_events.json (gravação atômica): checkpoint (maior cod publicado), vistos (cod -> hora),
@@ -11474,7 +11521,7 @@ class Profiler:
 def ask_catkey(ident, live=None, force=False):
     """Pergunta a chave do catálogo (com *, como os outros segredos) e grava em server_monitor.catkey (600).
     Sem force: só quando o acesso está permitido, o Firebase está configurado e ainda não há chave (a conexão
-    usa db_config/{sid} ou, sem ele, DB_DEFAULTS). Devolve True se gravou."""
+    usa db_config/{sid}, que pode trazer a senha cifrada com esta chave). Devolve True se gravou."""
     path = os.path.join(ident.base, CATKEY_FILE)
     if not force:
         if read_catkey(path) is not None or not ident.sync_cfg()["db_access"] or live is None:
@@ -11509,7 +11556,7 @@ FILE_STATE = "files.json"          # SYNC_DIR/files.json: downloads aceitos (ret
 FILE_DIR = "recebidos"             # <pasta do agente>/recebidos/<nome> (v2.21: nome original, sobrescreve)
 FILE_PART_DIR = ".parcial"         # recebidos/.parcial/<fid>.part: download em andamento
 FILE_MAX = 200 * 1024 * 1024       # bytes por arquivo
-FILE_VALID_MAX = 31 * 86400 * 1000 # ms: validade máxima de um pedido (30 dias + folga de relógio)
+FILE_VALID_MAX = 8 * 86400 * 1000  # ms: validade máxima de um pedido (7 dias das regras, v2.24, + folga de relógio)
 FILE_FREE_MARGIN = 200 * 1024 * 1024   # espaço livre exigido além de 2 x o tamanho
 FILE_POLL = 600                    # s: leitura de garantia de db_requests/{sid}/file sem a escuta do DbAgent
 FILE_PROGRESS = 5                  # s entre gravações do progresso em file_status
@@ -11528,6 +11575,25 @@ FILE_SIG_RE = re.compile(r"^[0-9a-f]{64}$")
 FILE_SUBDIR_RE = re.compile(r"^[A-Za-z0-9._ -]+(/[A-Za-z0-9._ -]+)*$")   # v2.20: subpasta relativa em recebidos/
 FILE_WIN_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {"COM%d" % i for i in range(1, 10)} | {"LPT%d" % i for i in range(1, 10)}
 FILE_FIELDS = ("name", "size", "sha256", "url", "token", "overwrite", "expires_at", "created_at", "by_name", "sig")
+
+
+def file_token_open(d, key_path, aad):
+    """v2.24: o token do depósito pode vir cifrado (token_seal = seal com a chave do catálogo, aad
+    file:<sid>:<fid> / pull:<sid>:<fid>) em vez de `token` em claro. Devolve o pedido com `token` em claro (só em
+    memória e no estado local 600) ou FileError. Exatamente um dos dois (as regras exigem o mesmo)."""
+    if not isinstance(d, dict) or "token_seal" not in d:
+        return d
+    if "token" in d:
+        raise FileError("pedido_invalido", "pedido com token em claro e cifrado ao mesmo tempo")
+    key = read_catkey(key_path)
+    if key is None:
+        raise FileError("sem_chave", "o agente não tem a chave do catálogo (no servidor: --catalogo-chave)")
+    tok = unseal(key, aad, d["token_seal"])
+    if tok is None:
+        raise FileError("assinatura", "token cifrado do pedido não confere com a chave do catálogo deste agente")
+    out = {k: v for k, v in d.items() if k != "token_seal"}
+    out["token"] = tok
+    return out
 
 
 class FileError(Exception):
@@ -11897,6 +11963,7 @@ class FileReceiver:
 
     def check(self, fid, d):
         """Pedido validado (cópia só com os campos do contrato) ou FileError (nada é baixado)."""
+        d = file_token_open(d, self.key_path, "file:%s:%s" % (self.sid, fid))
         if not isinstance(d, dict) or not all(k in d for k in FILE_FIELDS):
             raise FileError("pedido_invalido", "pedido incompleto")
         ok = (isinstance(d["name"], str) and is_int(d["size"]) and isinstance(d["sha256"], str)
@@ -11921,7 +11988,7 @@ class FileReceiver:
         if d["expires_at"] <= now_ms:
             raise FileError("expirado", "pedido expirado antes de ser recebido")
         if d["expires_at"] - d["created_at"] > FILE_VALID_MAX:
-            raise FileError("pedido_invalido", "validade maior que 30 dias")
+            raise FileError("pedido_invalido", "validade maior que 7 dias")
         key = read_catkey(self.key_path)
         if key is None:
             raise FileError("sem_chave", "o agente não tem a chave do catálogo (no servidor: --catalogo-chave)")
@@ -12451,6 +12518,7 @@ class FileReceiver:
     def pull_check(self, fid, d, info):
         """Pedido validado → job {path real, name, size, mtime_ns, url, token, expires_at}; senão FileError (o que
         já se sabe do arquivo, nome e tamanho, fica em `info` para o pull_status)."""
+        d = file_token_open(d, self.key_path, "pull:%s:%s" % (self.sid, fid))
         if not isinstance(d, dict) or not all(k in d for k in PULL_FIELDS):
             raise FileError("pedido_invalido", "pedido incompleto")
         if not (isinstance(d["path"], str) and isinstance(d["url"], str) and isinstance(d["token"], str)
@@ -12697,6 +12765,710 @@ class FileReceiver:
         with contextlib.suppress(Exception):
             resp.read()
             resp.close()
+
+
+# --------------------------------------------------------------------------
+# Acesso remoto pelo MeshCentral (v2.24, contrato em docs/ACESSO_REMOTO.md): a central liga/desliga (interruptor
+# geral E por servidor, documentos assinados com a chave do catálogo); o agente instala o MeshAgent baixado do
+# MeshCentral da C2, confere que está rodando, desinstala quando desligado e informa o nodeid. O meshid (identificador
+# do grupo) é segredo: nunca vai para log, status, erro ou diagnóstico (mesh_scrub em todo texto que sai).
+# --------------------------------------------------------------------------
+MESH_HOSTS = ("mesh.cbalmeida.com",)   # hosts aceitos na url de mesh_config/servers/{sid} (só https)
+MESH_FILE = "mesh.json"                # SYNC_DIR/mesh.json: documentos aceitos (rev/sig, sem o meshid) e o que foi aplicado
+MESH_TMP = "mesh_tmp"                  # SYNC_DIR/mesh_tmp/: instalador baixado (apagado logo depois de rodar)
+MESH_CHECK = 3600                      # s entre conferências (o aviso signals/{sid}/mesh_at antecipa)
+MESH_RETRY = 300                       # s até tentar de novo depois de falha ao ler o Firebase
+MESH_FIRST_WAIT = 120                  # s no máximo esperando o 1º heartbeat antes do 1º ciclo
+MESH_STATUS_EVERY = 6 * 3600           # s: mesh_status regravado mesmo sem mudança
+MESH_DL_MAX = 64 << 20                 # bytes: o MeshAgent tem ~3-5 MB
+MESH_DL_TIMEOUT = 60                   # s sem resposta do MeshCentral
+MESH_CMD_TIMEOUT = 300                 # s por -fullinstall/-fulluninstall
+MESH_INFO_TIMEOUT = 30                 # s por -nodeid/-info/sc/systemctl
+MESH_START_WAIT = 15                   # s esperando o serviço chegar a "rodando" depois de iniciar
+MESH_SWITCH_TAG = "c2-mesh-switch-v1"  # mesh_config/switch (interruptor geral)
+MESH_SERVER_TAG = "c2-mesh-v2"         # mesh_config/servers/{sid} (com url e meshid, cópia por servidor)
+MESH_WIN_SERVICE = "Mesh Agent"        # nome do serviço e da chave HKLM\SOFTWARE\Open Source\<nome> (agentcore.c)
+MESH_WIN_REG = "SOFTWARE\\Open Source\\Mesh Agent"
+MESH_WIN_DIR = ""                      # vazio = %ProgramFiles%\Mesh Agent (service-manager.js); testes sobrescrevem
+MESH_LINUX_SERVICE = "meshagent"
+MESH_LINUX_DIR = "/usr/local/mesh_services/meshagent"     # service-manager.js: /usr/local/mesh_services/<nome>/
+MESH_UNIT_DIRS = ("/lib/systemd/system", "/usr/lib/systemd/system", "/etc/systemd/system")
+MESH_TYPES = {"windows": {"amd64": 4, "x86_64": 4, "x86": 3, "i386": 3, "i686": 3, "arm64": 43, "aarch64": 43},
+              "linux": {"x86_64": 6, "amd64": 6, "i386": 5, "i486": 5, "i586": 5, "i686": 5, "aarch64": 26,
+                        "arm64": 26, "armv7l": 25, "armv6l": 25, "armhf": 25}}
+MESH_ID_RE = re.compile(r"^[A-Za-z0-9@$]{20,128}$")      # meshid na forma do MeshCentral (base64 com @ e $)
+MESH_NODE_RE = re.compile(r"^[A-Za-z0-9@$]{64}$")        # nodeid curto: SHA-384 (48 bytes) em base64 com @ e $
+MESH_HEX_NODE_RE = re.compile(r"^[0-9a-fA-F]{96}$")      # saída do "meshagent -nodeid" (hex do SHA-384)
+MESH_SIG_RE = re.compile(r"^[0-9a-f]{64}$")
+MESH_STATES = ("desligado", "instalando", "rodando", "parado", "ausente", "desinstalando", "erro", "sem_permissao",
+               "sem_suporte")
+MESH_SWITCH_FIELDS = ("enabled", "rev", "ts", "sig")
+MESH_SERVER_FIELDS = ("url", "meshid", "enabled", "reinstall", "rev", "ts", "sig")
+
+
+SEAL_TAG = "c2-seal-v1"
+SEAL_RE = re.compile(r"^v1\.[A-Za-z0-9_-]{64,400}$")     # "v1." + base64url sem "=" (nonce 16 + texto + tag 32)
+
+
+def seal_keys(key):
+    """(k_enc, k_mac) derivadas da chave do catálogo (os 32 bytes, como no HMAC das assinaturas)."""
+    return (hmac.new(key, (SEAL_TAG + " enc").encode(), hashlib.sha256).digest(),
+            hmac.new(key, (SEAL_TAG + " mac").encode(), hashlib.sha256).digest())
+
+
+def seal_stream(k_enc, nonce, n):
+    out = bytearray()
+    i = 0
+    while len(out) < n:
+        out += hmac.new(k_enc, nonce + struct.pack(">I", i), hashlib.sha256).digest()
+        i += 1
+    return bytes(out[:n])
+
+
+def seal_tag(k_mac, aad, nonce, ct):
+    return hmac.new(k_mac, (SEAL_TAG + "\n").encode() + aad.encode("utf-8") + b"\n" + nonce + ct,
+                    hashlib.sha256).digest()
+
+
+def seal(key, aad, text, nonce=None):
+    """Cifra ponta a ponta com a chave do catálogo (só biblioteca padrão; docs/ACESSO_REMOTO.md §2.1):
+    keystream HMAC-SHA256(k_enc, nonce || i) e tag HMAC-SHA256(k_mac, "c2-seal-v1\n" || aad || "\n" || nonce || ct).
+    aad amarra o cifrado ao lugar de uso (ex. "mesh:<sid>"). Devolve "v1." + base64url sem "="."""
+    k_enc, k_mac = seal_keys(key)
+    nonce = os.urandom(16) if nonce is None else nonce
+    pt = text.encode("utf-8")
+    ct = bytes(a ^ b for a, b in zip(pt, seal_stream(k_enc, nonce, len(pt))))
+    return "v1." + base64.urlsafe_b64encode(nonce + ct + seal_tag(k_mac, aad, nonce, ct)).decode().rstrip("=")
+
+
+def unseal(key, aad, sealed):
+    """Texto de seal() ou None (formato, chave, aad ou tag errados; a tag é conferida em tempo constante antes)."""
+    if not isinstance(sealed, str) or not sealed.startswith("v1.") or key is None:
+        return None
+    b = sealed[3:]
+    try:
+        raw = base64.urlsafe_b64decode(b + "=" * (-len(b) % 4))
+    except (ValueError, TypeError):
+        return None
+    if len(raw) < 48:
+        return None
+    nonce, ct, tag = raw[:16], raw[16:-32], raw[-32:]
+    k_enc, k_mac = seal_keys(key)
+    if not hmac.compare_digest(seal_tag(k_mac, aad, nonce, ct), tag):
+        return None
+    try:
+        return bytes(a ^ b for a, b in zip(ct, seal_stream(k_enc, nonce, len(ct)))).decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+class MeshError(Exception):
+    """Falha de uma ação do acesso remoto: code = error.code de mesh_status (§1.3)."""
+
+    def __init__(self, code, msg):
+        super().__init__(msg)
+        self.code = code
+
+
+def mesh_switch_canon(d):
+    """Texto assinado do interruptor geral (mesh_config/switch)."""
+    return "\n".join([MESH_SWITCH_TAG, "*", "1" if d["enabled"] else "0", str(d["rev"]), str(d["ts"])])
+
+
+def mesh_server_canon(sid, d):
+    """Texto assinado do documento do servidor (mesh_config/servers/{sid}), que leva url e meshid."""
+    return "\n".join([MESH_SERVER_TAG, sid, d["url"], d["meshid"], "1" if d["enabled"] else "0", str(d["reinstall"]),
+                      str(d["rev"]), str(d["ts"])])
+
+
+def mesh_sig(key, text):
+    return hmac.new(key, text.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def mesh_int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def mesh_url_ok(url):
+    """https://<host de MESH_HOSTS>[:porta][/], sem usuário, consulta nem fragmento."""
+    if not isinstance(url, str) or len(url) > 200:
+        return False
+    try:
+        u = urllib.parse.urlsplit(url)
+        u.port
+    except (ValueError, TypeError):
+        return False
+    return (u.scheme == "https" and not (u.query or u.fragment or u.username or u.password)
+            and u.path in ("", "/") and (u.hostname or "").lower() in MESH_HOSTS)
+
+
+def mesh_mid(meshid):
+    """Impressão do meshid (para perceber troca de grupo sem guardar o segredo): 16 hex do SHA-256."""
+    return hashlib.sha256(("c2-mesh-mid\n" + meshid).encode()).hexdigest()[:16]
+
+
+def mesh_scrub(text, secret):
+    """Tira o meshid (como veio, codificado na URL e em hex, como no .msh) de qualquer texto que vá sair."""
+    text = str(text)
+    if not secret:
+        return text
+    forms = {secret, urllib.parse.quote(secret, safe=""), urllib.parse.quote(secret, safe="@")}
+    try:
+        raw = base64.b64decode(secret.replace("@", "+").replace("$", "/") + "=" * (-len(secret) % 4))
+        if raw:
+            forms |= {raw.hex(), raw.hex().upper()}
+    except (ValueError, TypeError):
+        pass
+    for f in sorted(forms, key=len, reverse=True):
+        text = text.replace(f, "***")
+    return text
+
+
+def mesh_nodeid_from_hex(h):
+    """'meshagent -nodeid' (hex do SHA-384 da chave do agente) -> 'node//<base64 com @ e $>' (meshagent.js)."""
+    b = base64.b64encode(bytes.fromhex(h)).decode()
+    return "node//" + b.replace("+", "@").replace("/", "$")
+
+
+def mesh_os():
+    if IS_WINDOWS:
+        return "windows"
+    return "linux" if sys.platform.startswith("linux") else ""
+
+
+def mesh_arch():
+    if IS_WINDOWS:
+        a = os.environ.get("PROCESSOR_ARCHITEW6432") or os.environ.get("PROCESSOR_ARCHITECTURE") or platform.machine()
+    else:
+        a = os.uname().machine if hasattr(os, "uname") else platform.machine()
+    return (a or "").lower()
+
+
+def mesh_admin():
+    """Linux: root. Windows: processo com direitos de administrador (a tarefa do agente roda como SYSTEM)."""
+    if not IS_WINDOWS:
+        return is_root()
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:                                # sem como saber: o instalador diz se faltar permissão
+        return True
+
+
+def mesh_exec(args, timeout=MESH_INFO_TIMEOUT, cwd=None):
+    """Executável do MeshAgent / sc.exe / systemctl sem shell: (código, saída). 127 = ausente ou tempo esgotado."""
+    try:
+        p = subprocess.run(list(args), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                           universal_newlines=True, timeout=timeout, cwd=cwd, errors="replace")
+        return p.returncode, (p.stdout or "").strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        return 127, str(e)
+
+
+def mesh_download(url, path, limit=MESH_DL_MAX):
+    """Baixa para path com TLS verificado (cadeia pública + raízes ISRG embutidas, proxy do ambiente, como o relay).
+    Mensagens sem a URL (que leva o meshid)."""
+    req = urllib.request.Request(url, headers={"User-Agent": "usage-monitor/" + VERSION})
+    try:
+        with file_opener().open(req, timeout=MESH_DL_TIMEOUT) as r, open(path, "wb") as f:
+            n = 0
+            while True:
+                b = r.read(FILE_CHUNK)
+                if not b:
+                    break
+                n += len(b)
+                if n > limit:
+                    raise MeshError("download", "resposta maior que %d MB" % (limit >> 20))
+                f.write(b)
+    except urllib.error.HTTPError as e:
+        raise MeshError("download", "MeshCentral respondeu HTTP %d%s" % (
+            e.code, " (meshid recusado: confira o grupo na central)" if e.code == 401 else ""))
+    except ssl.SSLError as e:
+        raise MeshError("download", "TLS: %s" % sql_tls_reason(e))
+    except (urllib.error.URLError, OSError) as e:
+        reason = getattr(e, "reason", e)
+        if isinstance(reason, ssl.SSLError):
+            reason = "TLS: " + sql_tls_reason(reason)
+        raise MeshError("download", "sem conexão com o MeshCentral (%s)" % reason)
+    return n
+
+
+class MeshLocal:
+    """O MeshAgent desta máquina: tipo de download, serviço, executável, nodeid e versão (lidos localmente)."""
+
+    def __init__(self):
+        self.os, self.arch = mesh_os(), mesh_arch()
+        self.type = MESH_TYPES.get(self.os, {}).get(self.arch)
+        if self.os == "windows":
+            base = MESH_WIN_DIR or os.path.join(os.environ.get("ProgramW6432") or os.environ.get("ProgramFiles")
+                                                or "C:\\Program Files", "Mesh Agent")
+            self.dir, self.service = base, MESH_WIN_SERVICE
+            self.exe = os.path.join(base, "MeshAgent.exe")
+        else:
+            self.dir, self.service = MESH_LINUX_DIR, MESH_LINUX_SERVICE
+            self.exe = os.path.join(MESH_LINUX_DIR, "meshagent")
+
+    def unsupported(self):
+        """Motivo de não haver suporte nesta máquina ou ''."""
+        if not self.os:
+            return "sistema sem MeshAgent suportado (%s)" % sys.platform
+        if self.type is None:
+            return "arquitetura %s sem MeshAgent no MeshCentral" % (self.arch or "?")
+        if self.os == "linux" and not systemd_ok():
+            return "Linux sem systemd (o agente só instala o MeshAgent com systemd)"
+        return ""
+
+    def unit_files(self):
+        return [p for p in (os.path.join(d, self.service + ".service") for d in MESH_UNIT_DIRS) if os.path.isfile(p)]
+
+    def service_state(self):
+        """(existe, rodando) do serviço do MeshAgent."""
+        if self.os == "windows":
+            rc, out = mesh_exec(["sc.exe", "query", self.service])
+            m = re.search(r"STATE\s*:\s*(\d+)", out)
+            return rc == 0 and m is not None, m is not None and m.group(1) == "4"     # 4 = RUNNING (sc.exe)
+        if self.os != "linux":
+            return False, False
+        exists = bool(self.unit_files())
+        return exists, exists and mesh_exec([SYSTEMCTL, "is-active", "--quiet", self.service])[0] == 0
+
+    def facts(self):
+        """{'exe', 'service', 'running', 'installed'}: instalado = executável E serviço (só um dos dois = quebrado)."""
+        svc, running = self.service_state()
+        exe = os.path.isfile(self.exe)
+        return {"exe": exe, "service": svc, "running": running, "installed": exe and svc}
+
+    def start(self):
+        cmd = ["sc.exe", "start", self.service] if self.os == "windows" else [SYSTEMCTL, "start", self.service]
+        rc, out = mesh_exec(cmd)
+        t_end = time.time() + MESH_START_WAIT
+        while True:
+            if self.service_state()[1]:
+                return True, out
+            if time.time() >= t_end:
+                return False, out
+            time.sleep(1)
+
+    def nodeid(self):
+        """'node//<64 caracteres>' ou ''. Windows: valor NodeId da chave do serviço (gravado pelo próprio agente, já
+        com @ e $); sem ele, ou no Linux, '<executável> -nodeid' (hex do SHA-384, lido do .db ao lado)."""
+        if self.os == "windows":
+            v = reg_value(MESH_WIN_REG, "NodeId")
+            if MESH_NODE_RE.match(v):
+                return "node//" + v
+        if not os.path.isfile(self.exe):
+            return ""
+        rc, out = mesh_exec([self.exe, "-nodeid"], cwd=self.dir)
+        for line in reversed(out.splitlines()):
+            if MESH_HEX_NODE_RE.match(line.strip()):
+                return mesh_nodeid_from_hex(line.strip())
+        return ""
+
+    def version(self):
+        """Versão do MeshAgent = data do commit do código (CommitDate no registro; 'Commit Date:' no -info) ou ''."""
+        v = reg_value(MESH_WIN_REG, "CommitDate") if self.os == "windows" else ""
+        if not v and os.path.isfile(self.exe):
+            m = re.search(r"Commit Date:\s*(\S.*)", mesh_exec([self.exe, "-info"], cwd=self.dir)[1])
+            v = m.group(1).strip() if m else ""
+        return clip(" ".join(v.split()), 64)
+
+
+class MeshKeeper:
+    """Thread 'acesso-remoto' (v2.24, docs/ACESSO_REMOTO.md). Depois do 1º heartbeat, a cada MESH_CHECK e no aviso
+    signals/{sid}/mesh_at: lê mesh_config/switch e mesh_config/servers/{sid}, confere assinatura (chave do catálogo)
+    e rev (anti-repetição em SYNC_DIR/mesh.json), calcula o desejado (geral E servidor) e age: instala, inicia,
+    reinstala (contador reinstall ou troca de grupo) ou desinstala. Grava mesh_status/{sid} a cada mudança e no
+    máximo a cada 6 h sem mudança. Só desinstala o que está sob o controle do agente (instalado por ele ou servidor
+    já configurado na central) ou com o interruptor geral desligado de forma explícita (botão de pânico): um MeshAgent
+    instalado à mão continua lá enquanto a central não configurar o servidor."""
+
+    def __init__(self, cloud, out=None, ready=None):
+        self.cloud, self.live, self.ident, self.out = cloud, cloud.live, cloud.ident, out
+        self.sid = self.ident.install_id
+        self.key_path = os.path.join(cloud.base, CATKEY_FILE)
+        self.path = os.path.join(cloud.dir, MESH_FILE)
+        self.tmp = os.path.join(cloud.dir, MESH_TMP)
+        self.ready = ready                    # 1º heartbeat já foi (ligado pelo main)
+        self.stop_ev, self.wake_ev = threading.Event(), threading.Event()
+        self.thread = None
+        self.secret = ""                      # meshid do ciclo em andamento (só para mesh_scrub)
+        self.plain = ""                       # meshid decifrado do documento do servidor (judge)
+        self.sent, self.sent_at = None, 0.0   # último mesh_status confirmado (sem os carimbos)
+        self.last = {}                        # último ciclo (para o --diagnostico e testes)
+        self.st = self.load()
+
+    def say(self, s):
+        if self.out:
+            self.out(mesh_scrub(s, self.secret))
+
+    # ---- estado local ----
+    def load(self):
+        d = read_json(self.path)
+        d = d if isinstance(d, dict) else {}
+        st = {"switch": None, "server": None, "revs": {"switch": {}, "server": {}}, "server_seen": False,
+              "ours": False, "applied_reinstall": None, "installed_mid": "", "state": "", "changed_at": 0}
+        for k in ("switch", "server"):
+            if isinstance(d.get(k), dict) and isinstance(d[k].get("enabled"), bool) and mesh_int(d[k].get("rev")):
+                st[k] = d[k]
+            r = (d.get("revs") or {}).get(k) if isinstance(d.get("revs"), dict) else None
+            if isinstance(r, dict):
+                st["revs"][k] = {f: r[f] for f in ("rev", "ts") if mesh_int(r.get(f))}
+        for k in ("server_seen", "ours"):
+            st[k] = d.get(k) is True
+        if mesh_int(d.get("applied_reinstall")):
+            st["applied_reinstall"] = d["applied_reinstall"]
+        for k in ("installed_mid", "state"):
+            st[k] = d[k] if isinstance(d.get(k), str) else ""
+        st["changed_at"] = d["changed_at"] if mesh_int(d.get("changed_at")) else 0
+        return st
+
+    def save(self):
+        os.makedirs(self.cloud.dir, mode=0o700, exist_ok=True)
+        write_private(self.path, json.dumps(self.st, separators=(",", ":")))
+
+    # ---- ciclo de vida ----
+    def enabled(self):
+        return self.ident.sync_cfg()["remote_access"]
+
+    def start(self):
+        self.thread = threading.Thread(target=self.loop, name="acesso-remoto", daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_ev.set()
+        self.wake_ev.set()
+        if self.thread is not None and self.thread is not threading.current_thread():
+            self.thread.join(10)
+
+    def wake(self):
+        """Aviso da central (signals/{sid}/mesh_at): confere já."""
+        self.wake_ev.set()
+
+    def loop(self):
+        t_end = time.time() + MESH_FIRST_WAIT
+        while self.ready is not None and not self.stop_ev.is_set() and time.time() < t_end:
+            if self.ready():
+                break
+            self.stop_ev.wait(2)
+        while not self.stop_ev.is_set():
+            try:
+                wait = self.step()
+            except Exception as e:                        # nunca derruba a thread
+                self.say("Acesso remoto: erro interno (%s: %s)" % (type(e).__name__, e))
+                wait = MESH_RETRY
+            self.wake_ev.wait(wait)
+            self.wake_ev.clear()
+
+    def step(self):
+        if not self.enabled():
+            return MESH_CHECK                             # sync.remote_access false: não faz nada (nem desinstala)
+        try:
+            g = self.live.get("mesh_config/switch", timeout=15)
+            s = self.live.get("mesh_config/servers/" + self.sid, timeout=15)
+        except CloudError as e:
+            self.say("Acesso remoto: não leu a configuração da central (%s)" % e)
+            return MESH_RETRY
+        self.cycle(g, s)
+        return MESH_CHECK
+
+    # ---- documentos da central ----
+    def judge(self, kind, raw, key):
+        """('ausente'|'aceito'|'mesmo', doc) ou ('ignorado', MeshError). doc aceito = cópia sem meshid/sig crus."""
+        if raw is None:
+            return "ausente", None
+        srv = kind == "server"
+        fields = MESH_SERVER_FIELDS if srv else MESH_SWITCH_FIELDS
+        if (not isinstance(raw, dict) or not all(k in raw for k in fields) or not isinstance(raw["enabled"], bool)
+                or not all(mesh_int(raw[k]) for k in ("rev", "ts") + (("reinstall",) if srv else ()))
+                or not isinstance(raw["sig"], str) or not MESH_SIG_RE.match(raw["sig"])
+                or (srv and not (isinstance(raw["url"], str) and isinstance(raw["meshid"], str)))):
+            return "ignorado", MeshError("assinatura", "documento %s fora do formato" % kind)
+        if key is None:
+            return "ignorado", MeshError("chave_ausente", "sem a chave do catálogo (server_monitor.catkey)")
+        canon = mesh_server_canon(self.sid, raw) if srv else mesh_switch_canon(raw)
+        if not hmac.compare_digest(mesh_sig(key, canon), raw["sig"]):
+            return "ignorado", MeshError("assinatura", "assinatura do documento %s não confere" % kind)
+        prev = self.st[kind]
+        if prev is not None and raw["rev"] == prev.get("rev") and raw["sig"] == prev.get("sig"):
+            if srv:
+                p = unseal(key, "mesh:" + self.sid, raw["meshid"]) if raw["enabled"] else ""
+                self.plain = p if p and MESH_ID_RE.match(p) else ""
+            return "mesmo", prev
+        last = self.st["revs"][kind]
+        if raw["rev"] <= last.get("rev", 0) and raw["ts"] <= last.get("ts", 0):
+            # repetição de um documento antigo (rev e ts assinados não avançaram). Rev menor com ts novo = documento
+            # apagado e recriado pela central (rev recomeça), aceito.
+            return "ignorado", MeshError("rev_antiga", "documento %s com rev %d já usada (aceita: %d)" % (
+                kind, raw["rev"], last.get("rev", 0)))
+        plain = ""
+        if srv and raw["enabled"]:
+            if not mesh_url_ok(raw["url"]):
+                return "ignorado", MeshError("url_invalida", "url do MeshCentral fora da lista permitida (%s)" % (
+                    ", ".join(MESH_HOSTS)))
+            plain = unseal(key, "mesh:" + self.sid, raw["meshid"])
+            if plain is None or not MESH_ID_RE.match(plain):
+                return "ignorado", MeshError("assinatura", "meshid cifrado não confere com a chave do catálogo")
+        doc = {"enabled": raw["enabled"], "rev": raw["rev"], "ts": raw["ts"], "sig": raw["sig"]}
+        if srv:
+            self.plain = plain
+            doc.update(url=raw["url"], mid=mesh_mid(plain) if plain else "", reinstall=raw["reinstall"])
+        return "aceito", doc
+
+    def take(self, kind, raw, key, errors):
+        how, doc = self.judge(kind, raw, key)
+        if how == "ignorado":
+            errors.append(doc)
+            return False
+        if how == "aceito":
+            self.st["revs"][kind] = {"rev": max(doc["rev"], self.st["revs"][kind].get("rev", 0)),
+                                     "ts": max(doc["ts"], self.st["revs"][kind].get("ts", 0))}
+            self.say("Acesso remoto: configuração %s rev %d aceita (%s)" % (
+                "geral" if kind == "switch" else "do servidor", doc["rev"], "ligado" if doc["enabled"] else "desligado"))
+        self.st[kind] = doc
+        if kind == "server" and doc is not None:
+            self.st["server_seen"] = True
+        return True
+
+    # ---- ciclo ----
+    def cycle(self, g, s):
+        key = read_catkey(self.key_path)
+        errors = []
+        self.plain = ""
+        self.take("switch", g, key, errors)
+        s_ok = self.take("server", s, key, errors)
+        self.secret = meshid = self.plain if s_ok else ""     # meshid decifrado (só em memória, neste ciclo)
+        gd, sd = self.st["switch"], self.st["server"]
+        on = bool(gd and gd["enabled"] and sd and sd["enabled"])
+        loc = MeshLocal()
+        f = loc.facts() if loc.os else {"exe": False, "service": False, "running": False, "installed": False}
+        err = errors[0] if errors else None
+        try:
+            if on:
+                self.keep_on(loc, f, key, meshid, gd, sd)
+            else:
+                if sd is not None:
+                    self.st["applied_reinstall"] = sd["reinstall"]   # desligado: um "Reinstalar" antigo não vale depois
+                self.keep_off(loc, f, gd)
+        except MeshError as e:
+            err = e
+            self.say("Acesso remoto: %s" % e)
+        f = loc.facts() if loc.os else f
+        self.report(loc, f, on, err)
+        self.secret = ""
+
+    def managed(self):
+        return self.st["ours"] or self.st["server_seen"]
+
+    def need_admin(self, loc):
+        why = loc.unsupported()
+        if why:
+            raise MeshError("sem_suporte", why)
+        if not mesh_admin():
+            raise MeshError("sem_permissao", "o agente precisa rodar como %s para instalar/desinstalar o MeshAgent"
+                            % ("administrador" if loc.os == "windows" else "root"))
+
+    def keep_on(self, loc, f, key, meshid, gd, sd):
+        if self.st["applied_reinstall"] is None:
+            self.st["applied_reinstall"] = sd["reinstall"]   # 1º documento do servidor: só registra (não reinstala)
+        if f["installed"] and sd.get("mid") and not self.st["installed_mid"]:
+            self.st["installed_mid"] = sd["mid"]             # já instalado (inclusive à mão): assume o grupo atual
+        again = f["installed"] and (sd["reinstall"] > self.st["applied_reinstall"] or
+                                    bool(sd.get("mid") and self.st["installed_mid"] != sd["mid"]))
+        if again:
+            self.need_admin(loc)
+            why = "ordem da central" if sd["reinstall"] > self.st["applied_reinstall"] else "grupo trocado na central"
+            self.st["applied_reinstall"] = sd["reinstall"]
+            self.save()
+            self.say("Acesso remoto: reinstalando o MeshAgent (%s)" % why)
+            self.uninstall(loc)
+            f = loc.facts()
+        if not f["installed"]:
+            self.need_admin(loc)
+            if key is None:
+                raise MeshError("chave_ausente", "sem a chave do catálogo: o MeshAgent não é instalado")
+            if not meshid:
+                raise MeshError("assinatura", "sem configuração do servidor válida neste ciclo: o MeshAgent não é instalado")
+            self.install(loc, sd["url"], meshid, sd["mid"])
+            f = loc.facts()
+        if f["installed"] and not f["running"]:
+            self.need_admin(loc)
+            self.say("Acesso remoto: iniciando o serviço %s" % loc.service)
+            ok, out = loc.start()
+            if not ok:
+                raise MeshError("iniciar", "serviço %s não iniciou%s" % (loc.service, (": " + out[-200:]) if out else ""))
+
+    def keep_off(self, loc, f, gd):
+        if not (f["installed"] or f["exe"] or f["service"]):
+            if self.st["ours"]:
+                self.st["ours"] = False
+                self.save()
+            return
+        panic = gd is not None and not gd["enabled"]
+        if not (panic or self.managed()):
+            return                                        # instalado à mão e servidor nunca configurado: não mexe
+        self.need_admin(loc)
+        self.say("Acesso remoto: desinstalando o MeshAgent (desligado na central)")
+        self.uninstall(loc)
+
+    # ---- ações ----
+    def status_now(self, loc, state, on):
+        """mesh_status de transição (instalando/desinstalando), antes de uma ação demorada."""
+        self.report(loc, {"installed": False, "running": False}, on, None, state=state, light=True)
+
+    def install(self, loc, url, meshid, mid):
+        self.status_now(loc, "instalando", True)
+        self.say("Acesso remoto: baixando e instalando o MeshAgent (tipo %d)" % loc.type)
+        base = url.rstrip("/")
+        q = urllib.parse.quote(meshid, safe="@")         # o $ vai como %24
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        os.makedirs(self.tmp, mode=0o700, exist_ok=True)
+        try:
+            if loc.os == "windows":
+                exe = os.path.join(self.tmp, "meshagent%d.exe" % loc.type)
+                mesh_download("%s/meshagents?id=%d&meshid=%s&installflags=2" % (base, loc.type, q), exe)
+                self.check_file(exe, b"MZ")
+                cmd = [exe, "-fullinstall"]
+            else:
+                exe = os.path.join(self.tmp, "meshagent")
+                mesh_download("%s/meshagents?id=%d" % (base, loc.type), exe)
+                self.check_file(exe, b"\x7fELF")
+                os.chmod(exe, 0o700)
+                msh = os.path.join(self.tmp, "meshagent.msh")
+                mesh_download("%s/meshsettings?id=%s&installflags=2" % (base, q), msh, limit=64 << 10)
+                os.chmod(msh, 0o600)
+                with open(msh, "rb") as fh:
+                    if b"MeshID=" not in fh.read():
+                        raise MeshError("download", "configuração do grupo (.msh) inválida")
+                cmd = [exe, "-fullinstall", "--copy-msh=1"]
+            rc, out = mesh_exec(cmd, timeout=MESH_CMD_TIMEOUT, cwd=self.tmp)
+        finally:
+            shutil.rmtree(self.tmp, ignore_errors=True)
+        if "permissions needed" in out:
+            raise MeshError("sem_permissao", "o instalador do MeshAgent pediu permissão de administrador")
+        f = loc.facts()
+        if not f["installed"]:
+            raise MeshError("instalar", "MeshAgent não ficou instalado (código %d)%s" % (rc, self.tail(out)))
+        self.st.update(ours=True, installed_mid=mid)
+        self.save()
+        self.say("Acesso remoto: MeshAgent instalado%s" % (" e rodando" if f["running"] else ""))
+
+    def uninstall(self, loc):
+        self.status_now(loc, "desinstalando", False)
+        out, rc = "", 0
+        if os.path.isfile(loc.exe):
+            rc, out = mesh_exec([loc.exe, "-fulluninstall"], timeout=MESH_CMD_TIMEOUT, cwd=self.tmp_cwd())
+        self.leftovers(loc)
+        f = loc.facts()
+        if f["exe"] or f["service"]:
+            raise MeshError("desinstalar", "MeshAgent continua instalado (código %d)%s" % (rc, self.tail(out)))
+        self.st.update(ours=False, installed_mid="")
+        self.save()
+        self.say("Acesso remoto: MeshAgent desinstalado")
+
+    def tmp_cwd(self):
+        """Pasta de trabalho do -fulluninstall: fora da pasta do MeshAgent (que ele apaga)."""
+        os.makedirs(self.cloud.dir, mode=0o700, exist_ok=True)
+        return self.cloud.dir
+
+    def leftovers(self, loc):
+        """Sobras conhecidas depois do -fulluninstall (ou sem o executável): serviço e a pasta do MeshAgent."""
+        svc, _ = loc.service_state()
+        if svc:
+            if loc.os == "windows":
+                mesh_exec(["sc.exe", "stop", loc.service])
+                mesh_exec(["sc.exe", "delete", loc.service])
+            else:
+                mesh_exec([SYSTEMCTL, "disable", "--now", loc.service])
+                for p in loc.unit_files():
+                    with contextlib.suppress(OSError):
+                        os.remove(p)
+                mesh_exec([SYSTEMCTL, "daemon-reload"])
+        if os.path.isdir(loc.dir):
+            shutil.rmtree(loc.dir, ignore_errors=True)
+
+    @staticmethod
+    def check_file(path, magic):
+        with open(path, "rb") as fh:
+            if fh.read(len(magic)) != magic:
+                raise MeshError("download", "o arquivo baixado não é o executável do MeshAgent")
+
+    def tail(self, out):
+        lines = [l.strip() for l in (out or "").splitlines() if l.strip()]
+        return (": " + " | ".join(lines[-3:])) if lines else ""
+
+    # ---- mesh_status/{sid} ----
+    def report(self, loc, f, on, err, state=None, light=False):
+        why = loc.unsupported()
+        if state is None:
+            if err is not None and err.code in ("sem_permissao", "sem_suporte"):
+                state = err.code
+            elif err is not None:
+                state = "erro"
+            elif on:
+                state = "rodando" if f["running"] else "parado" if f["installed"] else "ausente"
+            else:
+                state = "desligado"
+        doc = {"state": state, "desired": "on" if on else "off", "installed": bool(f["installed"]),
+               "running": bool(f["running"]), "managed": self.managed(),
+               "applied_global_rev": (self.st["switch"] or {}).get("rev", 0),   # rev do interruptor geral (switch)
+               "applied_server_rev": (self.st["server"] or {}).get("rev", 0),
+               "applied_reinstall": self.st["applied_reinstall"] or 0, "agent_version": VERSION}
+        if loc.os and not why:
+            doc["service"] = loc.service
+        if not light and f["installed"]:
+            nid = loc.nodeid()
+            if nid:
+                doc["nodeid"] = nid
+            elif err is None and f["running"]:
+                err = MeshError("nodeid", "não consegui ler o nodeid do MeshAgent instalado")
+                doc["state"] = "erro"
+            ver = loc.version()
+            if ver:
+                doc["version"] = ver
+        if err is not None:
+            doc["error"] = {"code": err.code, "message": clip(mesh_scrub(str(err), self.secret), 300)}
+        now_ms = int(time.time() * 1000)
+        if doc["state"] != self.st["state"] or not self.st["changed_at"]:
+            self.st.update(state=doc["state"], changed_at=now_ms)
+        self.save()
+        self.last = dict(doc)
+        if not light and doc == self.sent and time.time() - self.sent_at < MESH_STATUS_EVERY:
+            return
+        body = dict(doc, checked_at={".sv": "timestamp"}, changed_at=self.st["changed_at"])
+        try:
+            self.live.patch("", {"mesh_status/" + self.sid: body}, timeout=15)
+        except CloudError as e:
+            self.sent = None
+            self.say("Acesso remoto: não gravou mesh_status (%s)" % e)
+            return
+        self.sent, self.sent_at = (None, 0.0) if light else (doc, time.time())
+
+
+def mesh_report(ident, out=print):
+    """Seção "Acesso remoto" do --diagnostico (nunca mostra o meshid; só lê)."""
+    cfg = ident.sync_cfg()
+    loc = MeshLocal()
+    why = loc.unsupported()
+    out("Acesso remoto (MeshCentral): %s | hosts permitidos: %s" % (
+        "ligado conforme a central" if cfg["remote_access"] else "DESLIGADO (sync.remote_access)", ", ".join(MESH_HOSTS)))
+    if why:
+        out("  sem suporte: %s" % why)
+    else:
+        f = loc.facts()
+        out("  tipo %d (%s/%s) | serviço %r: %s | executável %s: %s | permissão de administrador: %s" % (
+            loc.type, loc.os, loc.arch, loc.service, "rodando" if f["running"] else "existe, parado" if f["service"]
+            else "não existe", loc.exe, "existe" if f["exe"] else "não existe", "sim" if mesh_admin() else "NÃO"))
+        if f["installed"]:
+            out("  nodeid: %s | versão: %s" % (loc.nodeid() or "não lido", loc.version() or "não lida"))
+    st = read_json(os.path.join(ident.base, SYNC_DIR, MESH_FILE))
+    if isinstance(st, dict):
+        g, s = st.get("switch") or {}, st.get("server") or {}
+        out("  último estado: %s | geral rev %s (%s) | servidor rev %s (%s) | reinstalar aplicado: %s | %s" % (
+            st.get("state") or "-", g.get("rev", "-"), "ligado" if g.get("enabled") else "desligado",
+            s.get("rev", "-"), "ligado" if s.get("enabled") else "desligado", st.get("applied_reinstall", "-"),
+            "instalado pelo agente" if st.get("ours") else "servidor configurado na central" if st.get("server_seen")
+            else "ainda não configurado na central"))
+    else:
+        out("  ainda sem configuração recebida da central")
 
 
 # --------------------------------------------------------------------------
@@ -15812,14 +16584,15 @@ def run_diagnostics(log, ident, host, script_dir, out=print):
             out("  login do servidor no Firebase: OK")
         except CloudError as e:
             out("  login do servidor no Firebase: ERRO %s" % e)
-    d = DB_DEFAULTS
+    d = DB_DIAG
     try:
-        PgConn(d["host"], d["port"], d["dbname"], d["user"], d["password"], d["sslmode"], timeout=5).close()
-        out("Banco local (padrão %s:%s/%s): conectou" % (d["host"], d["port"], d["dbname"]))
-    except DbError as e:
-        out("Banco local (padrão %s:%s/%s): %s [%s] (a central pode gravar outra conexão em db_config)" % (
-            d["host"], d["port"], d["dbname"], e, e.code))
+        socket.create_connection((d["host"], d["port"]), timeout=5).close()
+        out("Banco local (%s:%s): porta aberta (a conexão e a senha vêm de db_config, gravado pela central)" % (
+            d["host"], d["port"]))
+    except OSError as e:
+        out("Banco local (%s:%s): porta fechada ou inacessível (%s)" % (d["host"], d["port"], e))
     run_sql_diagnostics(ident, cfg, ac, out)
+    mesh_report(ident, out)
     if IS_WINDOWS:
         sysdir = os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "System32")
         out("Windows: Universal C Runtime (%s): %s" % (UCRT_DLL, "presente" if any(os.path.exists(os.path.join(sysdir, f)) for f in ("ucrtbase.dll", UCRT_DLL))
@@ -16154,6 +16927,7 @@ def main():
             mon.sql = SqlEditor(cloud, mon.db, out=mon.say)    # editor SQL: pedidos pela mesma escuta do DbAgent
             mon.prof = Profiler(cloud, mon.db, out=mon.say)    # profile do banco: idem
             mon.files = FileReceiver(cloud, mon.db, out=mon.say)   # arquivos da central: idem (ou lê sozinho)
+            mon.mesh = MeshKeeper(cloud, out=mon.say, ready=lambda: sync.last_hb > 0)   # MeshAgent (v2.24)
             # filas ERP (v2.18): uma leitura por janela, com a configuração do DbAgent e os limites da central
             mon.queues = cloud.queues = QueueReader(mon.db, mon.next_boundary, cloud.acfg, out=mon.say,
                                                     path=os.path.join(cloud.dir, QUEUE_SEEN_FILE))
@@ -16162,6 +16936,7 @@ def main():
     mon.updater.acfg = cloud.acfg                         # intervalo e janela da autoatualização (central)
     if sync is not None:
         sync.updater, sync.db, sync.files = mon.updater, mon.db, mon.files   # avisos da central (signals/<sid>)
+        sync.mesh = mon.mesh
         sync.on_restart = lambda: mon.updater.request_restart("Coleta alterada pela central")
         sync.on_rename = lambda: mon.say("Renomeado pela central: empresa %s, servidor %s" % (
             ident.company or "-", ident.name or "-"))
@@ -16177,6 +16952,9 @@ def main():
         if mon.updater.start():
             print("Atualização automática: ATIVA (verifica a cada %d min)." % (mon.updater.cur_interval() // 60))
         if sync is not None:
+            if cloud.live.configured():                   # v2.24: instalações antigas apagam o código de cadastro
+                threading.Thread(target=cloud.live.drop_code, args=(ident.install_id,), name="cadastro",
+                                 daemon=True).start()
             sync.start()
             c = ident.sync_cfg()
             print("Nuvem: envio automático %s (a cada %d s; %d s em alerta; histórico a cada %d min)." % (
@@ -16201,6 +16979,11 @@ def main():
             mon.files.start()
             print("Arquivos enviados pela central: %s." % (
                 "recebe em %s" % mon.files.dir if ident.sync_cfg()["file_receive"] else "DESLIGADO (sync.file_receive)"))
+        if mon.mesh is not None:
+            mon.mesh.start()
+            print("Acesso remoto (MeshCentral): %s." % ("conforme a central (geral e por servidor)"
+                                                      if ident.sync_cfg()["remote_access"]
+                                                      else "DESLIGADO (sync.remote_access)"))
         if mon.queues is not None:
             mon.queues.start()
             print("Filas ERP (admin.monitor_filas): %s." % ("lidas a cada janela junto com o acesso ao banco"
