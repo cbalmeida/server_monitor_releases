@@ -105,7 +105,7 @@ except ImportError:
 from array import array
 from xml.sax.saxutils import escape as xml_escape
 
-VERSION = "2.24.0"
+VERSION = "2.24.1"
 # Projeto Firebase da C2 (padrão do --firebase-setup). Não são segredos: a URL só identifica o banco e
 # a chave só identifica o projeto (restrita às APIs de login); o acesso é decidido pelas regras.
 FIREBASE_DB_URL = "https://c2-server-monitor-default-rtdb.firebaseio.com"
@@ -13077,9 +13077,10 @@ class MeshKeeper:
     signals/{sid}/mesh_at: lê mesh_config/switch e mesh_config/servers/{sid}, confere assinatura (chave do catálogo)
     e rev (anti-repetição em SYNC_DIR/mesh.json), calcula o desejado (geral E servidor) e age: instala, inicia,
     reinstala (contador reinstall ou troca de grupo) ou desinstala. Grava mesh_status/{sid} a cada mudança e no
-    máximo a cada 6 h sem mudança. Só desinstala o que está sob o controle do agente (instalado por ele ou servidor
-    já configurado na central) ou com o interruptor geral desligado de forma explícita (botão de pânico): um MeshAgent
-    instalado à mão continua lá enquanto a central não configurar o servidor."""
+    máximo a cada 6 h sem mudança. Desligado: desinstala o que o próprio agente instalou; um MeshAgent instalado à mão
+    só sai pelo botão de pânico, ou seja, um switch válido enabled:false aceito DEPOIS de um switch enabled:true
+    (transição ligado → desligado, `switch_seen_on` em mesh.json; v2.24.1). Salvar a configuração com o geral
+    desligado nunca mexe na instalação manual."""
 
     def __init__(self, cloud, out=None, ready=None):
         self.cloud, self.live, self.ident, self.out = cloud, cloud.live, cloud.ident, out
@@ -13105,15 +13106,17 @@ class MeshKeeper:
         d = read_json(self.path)
         d = d if isinstance(d, dict) else {}
         st = {"switch": None, "server": None, "revs": {"switch": {}, "server": {}}, "server_seen": False,
-              "ours": False, "applied_reinstall": None, "installed_mid": "", "state": "", "changed_at": 0}
+              "switch_seen_on": False, "ours": False, "applied_reinstall": None, "installed_mid": "", "state": "", "changed_at": 0}
         for k in ("switch", "server"):
             if isinstance(d.get(k), dict) and isinstance(d[k].get("enabled"), bool) and mesh_int(d[k].get("rev")):
                 st[k] = d[k]
             r = (d.get("revs") or {}).get(k) if isinstance(d.get("revs"), dict) else None
             if isinstance(r, dict):
                 st["revs"][k] = {f: r[f] for f in ("rev", "ts") if mesh_int(r.get(f))}
-        for k in ("server_seen", "ours"):
+        for k in ("server_seen", "switch_seen_on", "ours"):
             st[k] = d.get(k) is True
+        if st["switch"] is not None and st["switch"]["enabled"]:
+            st["switch_seen_on"] = True       # mesh.json da 2.24.0: o switch aceito já estava ligado
         if mesh_int(d.get("applied_reinstall")):
             st["applied_reinstall"] = d["applied_reinstall"]
         for k in ("installed_mid", "state"):
@@ -13224,6 +13227,8 @@ class MeshKeeper:
             self.say("Acesso remoto: configuração %s rev %d aceita (%s)" % (
                 "geral" if kind == "switch" else "do servidor", doc["rev"], "ligado" if doc["enabled"] else "desligado"))
         self.st[kind] = doc
+        if kind == "switch" and doc is not None and doc["enabled"]:
+            self.st["switch_seen_on"] = True     # arma o botão de pânico (só um desligado DEPOIS deste vale)
         if kind == "server" and doc is not None:
             self.st["server_seen"] = True
         return True
@@ -13256,7 +13261,8 @@ class MeshKeeper:
         self.secret = ""
 
     def managed(self):
-        return self.st["ours"] or self.st["server_seen"]
+        """Sob controle do agente = instalado por ele (v2.24.1: servidor configurado na central não basta)."""
+        return self.st["ours"]
 
     def need_admin(self, loc):
         why = loc.unsupported()
@@ -13297,17 +13303,22 @@ class MeshKeeper:
                 raise MeshError("iniciar", "serviço %s não iniciou%s" % (loc.service, (": " + out[-200:]) if out else ""))
 
     def keep_off(self, loc, f, gd):
+        # botão de pânico: switch desligado válido depois de um ligado já aceito (transição ligado → desligado)
+        panic = gd is not None and not gd["enabled"] and self.st["switch_seen_on"]
         if not (f["installed"] or f["exe"] or f["service"]):
-            if self.st["ours"]:
-                self.st["ours"] = False
+            if self.st["ours"] or panic:
+                self.st.update(ours=False, switch_seen_on=False if panic else self.st["switch_seen_on"])
                 self.save()
             return
-        panic = gd is not None and not gd["enabled"]
         if not (panic or self.managed()):
-            return                                        # instalado à mão e servidor nunca configurado: não mexe
+            return                                        # instalado à mão e sem pânico: não mexe
         self.need_admin(loc)
-        self.say("Acesso remoto: desinstalando o MeshAgent (desligado na central)")
+        self.say("Acesso remoto: desinstalando o MeshAgent (%s)" % (
+            "botão de pânico: interruptor geral desligado" if panic else "desligado na central"))
         self.uninstall(loc)
+        if panic:
+            self.st["switch_seen_on"] = False             # pânico consumido: só uma nova transição desinstala de novo
+            self.save()
 
     # ---- ações ----
     def status_now(self, loc, state, on):
@@ -13465,8 +13476,8 @@ def mesh_report(ident, out=print):
         out("  último estado: %s | geral rev %s (%s) | servidor rev %s (%s) | reinstalar aplicado: %s | %s" % (
             st.get("state") or "-", g.get("rev", "-"), "ligado" if g.get("enabled") else "desligado",
             s.get("rev", "-"), "ligado" if s.get("enabled") else "desligado", st.get("applied_reinstall", "-"),
-            "instalado pelo agente" if st.get("ours") else "servidor configurado na central" if st.get("server_seen")
-            else "ainda não configurado na central"))
+            "instalado pelo agente" if st.get("ours") else "não instalado pelo agente (instalação manual só sai pelo "
+            "botão de pânico)"))
     else:
         out("  ainda sem configuração recebida da central")
 
