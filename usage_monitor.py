@@ -105,7 +105,7 @@ except ImportError:
 from array import array
 from xml.sax.saxutils import escape as xml_escape
 
-VERSION = "2.25.0"
+VERSION = "2.25.1"
 # Projeto Firebase da C2 (padrão do --firebase-setup). Não são segredos: a URL só identifica o banco e
 # a chave só identifica o projeto (restrita às APIs de login); o acesso é decidido pelas regras.
 FIREBASE_DB_URL = "https://c2-server-monitor-default-rtdb.firebaseio.com"
@@ -13153,9 +13153,11 @@ class MeshLocal:
     def service_state(self):
         """(existe, rodando) do serviço do MeshAgent."""
         if self.os == "windows":
+            # rótulos do sc.exe seguem o idioma do Windows (STATE/ESTADO...; Batista, v2.25.1): só o código do estado
+            # (1-7) seguido do nome em inglês, que não é traduzido; 4 = RUNNING
             rc, out = mesh_exec(["sc.exe", "query", self.service])
-            m = re.search(r"STATE\s*:\s*(\d+)", out)
-            return rc == 0 and m is not None, m is not None and m.group(1) == "4"     # 4 = RUNNING (sc.exe)
+            m = re.search(r":\s*([1-7])\s+[A-Z_]+\s*$", out, re.M)
+            return rc == 0 and m is not None, m is not None and m.group(1) == "4"
         if self.os != "linux":
             return False, False
         exists = bool(self.unit_files())
@@ -13508,7 +13510,8 @@ class MeshKeeper:
             raise MeshError("sem_permissao", "o instalador do MeshAgent pediu permissão de administrador")
         f = loc.facts()
         if not f["installed"]:
-            raise MeshError("instalar", "MeshAgent não ficou instalado (código %d)%s" % (rc, self.tail(out)))
+            raise MeshError("instalar", "MeshAgent não ficou instalado (código %d; executável %s, serviço %s)%s" % (
+                rc, "sim" if f["exe"] else "não", "sim" if f["service"] else "não", self.tail(out)))
         self.st.update(ours=True, installed_mid=mid)
         self.save()
         self.say("Acesso remoto: MeshAgent instalado%s" % (" e rodando" if f["running"] else ""))
