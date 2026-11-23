@@ -3,7 +3,7 @@
 #                 (Windows 7 / Server 2008 R2 ou mais novo; PowerShell 2.0+)
 #
 #  No PowerShell COMO ADMINISTRADOR (uma linha; funciona no PowerShell 2.0):
-#    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072; $w = New-Object Net.WebClient; $w.Headers.Add("User-Agent", "c2"); $w.Headers.Add("Accept", "application/vnd.github.raw"); $w.DownloadFile("https://api.github.com/repos/cbalmeida/server_monitor_releases/contents/instalar.ps1", "$env:TEMP\instalar.ps1"); powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\instalar.ps1"
+#    $u = "https://api.github.com/repos/cbalmeida/server_monitor_releases/contents/instalar.ps1"; $f = "$env:TEMP\instalar.ps1"; Remove-Item -Force -ErrorAction SilentlyContinue $f; try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072; $w = New-Object Net.WebClient; $w.Headers.Add("User-Agent", "c2"); $w.Headers.Add("Accept", "application/vnd.github.raw"); $w.DownloadFile($u, $f) } catch { foreach ($p in "WinHttp.WinHttpRequest.5.1", "Msxml2.XMLHTTP.6.0") { try { $x = New-Object -ComObject $p; if ($p -like "WinHttp*") { [void]$x.GetType().InvokeMember("Option", "SetProperty", $null, $x, @(9, 2720)) }; $x.Open("GET", $u, $false); $x.SetRequestHeader("Accept", "application/vnd.github.raw"); $x.Send(); if ($x.Status -eq 200) { [IO.File]::WriteAllBytes($f, [byte[]]$x.ResponseBody); break } } catch { } } }; if (Test-Path $f) { powershell -NoProfile -ExecutionPolicy Bypass -File $f } else { Write-Host "Sem TLS 1.2 neste Windows: instale o KB3154518 ou o .NET Framework 4.8 com o WMF 5.1 e rode de novo." -ForegroundColor Red }
 #
 #  Opcoes:  -Dir C:\outra\pasta   (padrao C:\c2\server_monitor)
 #           -Parar                (para o monitor e a tarefa agendada; nao remove nada)
@@ -45,15 +45,47 @@ function Ok($m)    { Write-Host "  [ok] $m" }
 function Aviso($m) { Write-Host "  [aviso] $m" -ForegroundColor Yellow }
 function Erro($m)  { Write-Host "  [ERRO] $m" -ForegroundColor Red; exit 1 }
 
+$script:DotNetTls = $false
 function Set-Tls12 {
     # TLS 1.2 (GitHub e python.org recusam TLS 1.0). 3072 = Tls12, mesmo no .NET 3.5 do PowerShell 2.0,
-    # desde que o Windows tenha o KB3154518 (7/2008 R2) ou o .NET 4.5+ (com WMF 3.0+).
+    # desde que o Windows tenha o KB3154518 (7/2008 R2) ou o .NET 4.5+ (com WMF 3.0+). Sem isso, Get-Bytes usa
+    # os downloads do proprio Windows (WinHTTP/WinINet).
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072
-        return $true
+        $script:DotNetTls = $true
     } catch {
-        return $false
+        $script:DotNetTls = $false
     }
+    return $script:DotNetTls
+}
+
+function Get-Bytes($url, $accept) {
+    # Download em 3 tentativas: o .NET (quando fala TLS 1.2); o WinHTTP do Windows com TLS 1.2 pedido explicitamente
+    # (Option 9 = SecureProtocols, 2720 = TLS 1.0|1.1|1.2); o WinINet, o mesmo do Internet Explorer (IE 11 ja vem com
+    # TLS 1.2). Windows 7/2008 R2 sem o KB3154518: o .NET do PowerShell 2.0 nao tem TLS 1.2, o Windows pode ter
+    # (Cadis-Windows, 2026-11-23).
+    $errs = @()
+    if ($script:DotNetTls) {
+        try {
+            $w = New-Web
+            if ($accept) { $w.Headers.Add("Accept", $accept) }
+            return ,$w.DownloadData($url)
+        } catch { $errs += ".NET: $($_.Exception.Message)" }
+    }
+    foreach ($p in @("WinHttp.WinHttpRequest.5.1", "Msxml2.XMLHTTP.6.0", "Msxml2.XMLHTTP")) {
+        try {
+            $x = New-Object -ComObject $p
+            if ($p -like "WinHttp*") { [void]$x.GetType().InvokeMember("Option", "SetProperty", $null, $x, @(9, 2720)) }
+            $x.Open("GET", $url, $false)
+            $x.SetRequestHeader("User-Agent", "c2-server-monitor-instalador")
+            if ($accept) { $x.SetRequestHeader("Accept", $accept) }
+            $x.Send()
+            if ($x.Status -ne 200) { throw "HTTP $($x.Status)" }
+            return ,([byte[]]$x.ResponseBody)
+        } catch { $errs += "${p}: $($_.Exception.Message)" }
+    }
+    throw ("nenhum meio de download com TLS 1.2 neste Windows (" + ($errs -join "; ") + "). Instale o KB3154518 " +
+           "ou o .NET Framework 4.8 com o WMF 5.1 e rode de novo.")
 }
 
 function New-Web {
@@ -65,9 +97,7 @@ function New-Web {
 function Get-GitHubFile($url, $dest) {
     # API "contents": pede o arquivo cru (Accept raw); se vier o JSON (proxy/.NET que ignore o Accept),
     # decodifica o campo "content" (base64) sem ConvertFrom-Json (nao existe no PowerShell 2.0).
-    $w = New-Web
-    $w.Headers.Add("Accept", "application/vnd.github.raw")
-    $bytes = $w.DownloadData($url)
+    $bytes = Get-Bytes $url "application/vnd.github.raw"
     $text = [Text.Encoding]::UTF8.GetString($bytes)
     if ($text.TrimStart().StartsWith("{") -and $text -match '"content"\s*:\s*"([^"]*)"') {
         $bytes = [Convert]::FromBase64String(($matches[1] -replace '\\n', '' -replace '\s', ''))
@@ -125,7 +155,7 @@ function Update-Roots {
     foreach ($u in @("https://c2-server-monitor-default-rtdb.firebaseio.com/.json",
                      "https://identitytoolkit.googleapis.com/", "https://securetoken.googleapis.com/",
                      "https://api.github.com/")) {
-        try { [void](New-Web).DownloadString($u) } catch { }
+        try { [void](Get-Bytes $u $null) } catch { }
     }
 }
 
@@ -139,7 +169,7 @@ Write-Host "   SERVER MONITOR (Windows) - instalacao"
 Write-Host "=================================================="
 if (-not (Test-Admin)) { Erro "rode no PowerShell como Administrador (botao direito > Executar como administrador)." }
 if (-not (Set-Tls12)) {
-    Aviso "este .NET nao habilita TLS 1.2 (instale o KB3154518 ou o .NET Framework 4.5+ e o WMF 5.1); os downloads podem falhar."
+    Aviso "o .NET deste PowerShell nao fala TLS 1.2: os downloads vao pelo proprio Windows (WinHTTP/Internet Explorer)."
 }
 
 # 0. Autoatualizacao ------------------------------------------------------------
@@ -244,7 +274,7 @@ if (-not $pyOk) {
     $zip = Join-Path $Dir $zipName
     if (-not (Test-Path $zip)) {
         try {
-            (New-Web).DownloadFile("https://www.python.org/ftp/python/$PyVersion/$zipName", $zip)
+            [IO.File]::WriteAllBytes($zip, (Get-Bytes "https://www.python.org/ftp/python/$PyVersion/$zipName" $null))
         } catch {
             Erro ("falha ao baixar o Python ($($_.Exception.Message)). Sem TLS 1.2/internet: baixe " +
                   "https://www.python.org/ftp/python/$PyVersion/$zipName em outra maquina, copie para $Dir e rode de novo.")

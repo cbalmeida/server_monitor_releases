@@ -1,6 +1,6 @@
 {
   "formato": 1,
-  "revisao": 3,
+  "revisao": 4,
   "descricao": "Modelos dos comandos de instalação do agente que a central mostra em \"Instalar agente\". Fonte única: mudou o instalar.sh/instalar.ps1 (URL, pasta, opções, pré-requisitos) -> atualize aqui, suba a revisao e copie para a central (assets/instalacao/comandos.json). Marcadores: {{config_json}} (JSON de configuração, uma linha, só ASCII), {{config_bash}}/{{config_ps}} (o mesmo JSON como texto entre aspas simples do bash/PowerShell), {{empresa_bash}}/{{nome_bash}} e {{empresa_ps}}/{{nome_ps}} (argumentos entre aspas simples; no PowerShell com \\\" para o programa nativo). Comando com \"segredo\": true é mascarado na tela.",
   "ambientes": [
     {
@@ -300,7 +300,7 @@
       "resumo": "Python 3.8.10 embutido na pasta do monitor; tarefa agendada \"C2 Server Monitor\" (como SYSTEM).",
       "notas": [
         "Abra o PowerShell com \"Executar como administrador\". Funciona no PowerShell 2.0 em diante.",
-        "Windows 7 / 2008 R2: precisa do Service Pack 1, KB2999226 (Universal C Runtime), KB2533623 e, para o TLS 1.2, KB3154518 (ou .NET 4.5+ com WMF 5.1). O instalador avisa o que faltar.",
+        "Windows 7 / 2008 R2: precisa do Service Pack 1, KB2999226 (Universal C Runtime), KB2533623 e TLS 1.2: sem o KB3154518 (ou .NET 4.5+ com WMF 5.1) o instalador baixa pelo próprio Windows (WinHTTP/Internet Explorer); se nem isso falar TLS 1.2, ele diz o que instalar.",
         "Pasta: C:\\C2Tecnologia\\ServerMonitor (só SYSTEM e Administradores acessam).",
         "Monitoramento básico: CPU, memória e espaço; desempenho de disco fica sem dados."
       ],
@@ -310,13 +310,13 @@
           "titulo": "Instalar e configurar (um comando só)",
           "segredo": true,
           "descricao": "Cole no PowerShell como Administrador. Baixa o instalador, aplica a configuração (empresa, nome, Firebase e chave do catálogo) e registra a tarefa agendada sem perguntar nada. O arquivo temporário com a configuração é apagado em seguida; o PowerShell 5.1 com PSReadLine atualizado (e o 7) não grava no histórico a linha com a variável $secret.",
-          "modelo": "[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072; $secret = {{config_ps}}; $env:USAGE_MONITOR_CONFIG = \"$env:TEMP\\c2_server_monitor_config.json\"; [IO.File]::WriteAllText($env:USAGE_MONITOR_CONFIG, $secret); $secret = $null; $w = New-Object Net.WebClient; $w.Headers.Add(\"User-Agent\", \"c2\"); $w.Headers.Add(\"Accept\", \"application/vnd.github.raw\"); $w.DownloadFile(\"https://api.github.com/repos/cbalmeida/server_monitor_releases/contents/instalar.ps1\", \"$env:TEMP\\instalar.ps1\"); powershell -NoProfile -ExecutionPolicy Bypass -File \"$env:TEMP\\instalar.ps1\"; Remove-Item -Force -ErrorAction SilentlyContinue $env:USAGE_MONITOR_CONFIG; $env:USAGE_MONITOR_CONFIG = $null"
+          "modelo": "$secret = {{config_ps}}; $env:USAGE_MONITOR_CONFIG = \"$env:TEMP\\c2_server_monitor_config.json\"; [IO.File]::WriteAllText($env:USAGE_MONITOR_CONFIG, $secret); $secret = $null; $u = \"https://api.github.com/repos/cbalmeida/server_monitor_releases/contents/instalar.ps1\"; $f = \"$env:TEMP\\instalar.ps1\"; Remove-Item -Force -ErrorAction SilentlyContinue $f; try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072; $w = New-Object Net.WebClient; $w.Headers.Add(\"User-Agent\", \"c2\"); $w.Headers.Add(\"Accept\", \"application/vnd.github.raw\"); $w.DownloadFile($u, $f) } catch { foreach ($p in \"WinHttp.WinHttpRequest.5.1\", \"Msxml2.XMLHTTP.6.0\") { try { $x = New-Object -ComObject $p; if ($p -like \"WinHttp*\") { [void]$x.GetType().InvokeMember(\"Option\", \"SetProperty\", $null, $x, @(9, 2720)) }; $x.Open(\"GET\", $u, $false); $x.SetRequestHeader(\"Accept\", \"application/vnd.github.raw\"); $x.Send(); if ($x.Status -eq 200) { [IO.File]::WriteAllBytes($f, [byte[]]$x.ResponseBody); break } } catch { } } }; if (Test-Path $f) { powershell -NoProfile -ExecutionPolicy Bypass -File $f } else { Write-Host \"Sem TLS 1.2 neste Windows: instale o KB3154518 ou o .NET Framework 4.8 com o WMF 5.1 e rode de novo.\" -ForegroundColor Red }; Remove-Item -Force -ErrorAction SilentlyContinue $env:USAGE_MONITOR_CONFIG; $env:USAGE_MONITOR_CONFIG = $null"
         },
         {
           "id": "instalar",
           "titulo": "Só instalar (o monitor pergunta a configuração)",
           "descricao": "Alternativa sem a configuração embutida: quando o monitor pedir, cole o JSON de configuração abaixo.",
-          "modelo": "[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072; $w = New-Object Net.WebClient; $w.Headers.Add(\"User-Agent\", \"c2\"); $w.Headers.Add(\"Accept\", \"application/vnd.github.raw\"); $w.DownloadFile(\"https://api.github.com/repos/cbalmeida/server_monitor_releases/contents/instalar.ps1\", \"$env:TEMP\\instalar.ps1\"); powershell -NoProfile -ExecutionPolicy Bypass -File \"$env:TEMP\\instalar.ps1\""
+          "modelo": "$u = \"https://api.github.com/repos/cbalmeida/server_monitor_releases/contents/instalar.ps1\"; $f = \"$env:TEMP\\instalar.ps1\"; Remove-Item -Force -ErrorAction SilentlyContinue $f; try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072; $w = New-Object Net.WebClient; $w.Headers.Add(\"User-Agent\", \"c2\"); $w.Headers.Add(\"Accept\", \"application/vnd.github.raw\"); $w.DownloadFile($u, $f) } catch { foreach ($p in \"WinHttp.WinHttpRequest.5.1\", \"Msxml2.XMLHTTP.6.0\") { try { $x = New-Object -ComObject $p; if ($p -like \"WinHttp*\") { [void]$x.GetType().InvokeMember(\"Option\", \"SetProperty\", $null, $x, @(9, 2720)) }; $x.Open(\"GET\", $u, $false); $x.SetRequestHeader(\"Accept\", \"application/vnd.github.raw\"); $x.Send(); if ($x.Status -eq 200) { [IO.File]::WriteAllBytes($f, [byte[]]$x.ResponseBody); break } } catch { } } }; if (Test-Path $f) { powershell -NoProfile -ExecutionPolicy Bypass -File $f } else { Write-Host \"Sem TLS 1.2 neste Windows: instale o KB3154518 ou o .NET Framework 4.8 com o WMF 5.1 e rode de novo.\" -ForegroundColor Red }"
         },
         {
           "id": "config",
