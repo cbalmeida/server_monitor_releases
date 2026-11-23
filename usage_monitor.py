@@ -106,7 +106,7 @@ except ImportError:
 from array import array
 from xml.sax.saxutils import escape as xml_escape
 
-VERSION = "2.25.2"
+VERSION = "2.25.3"
 # Projeto Firebase da C2 (padrão do --firebase-setup). Não são segredos: a URL só identifica o banco e
 # a chave só identifica o projeto (restrita às APIs de login); o acesso é decidido pelas regras.
 FIREBASE_DB_URL = "https://c2-server-monitor-default-rtdb.firebaseio.com"
@@ -5088,6 +5088,82 @@ def db_cfg_open(cfg, key, sid):
     out = {k: v for k, v in cfg.items() if k != "password_seal"}
     out["password"] = pw
     return out, None
+# v2.25.3: host do banco pelo DBParams.ini dos aplicativos da C2 (Windows de empresa com Windows + Linux: o banco roda
+# no Linux e o ini aponta para ele). Prioridade: host próprio do servidor no db_config > DBParams.ini > padrão local.
+DBPARAMS_FILE = "DBParams.ini"
+DBPARAMS_PATHS = None           # None = <pasta do agente>/../Modulos e %SystemDrive%\C2Tecnologia\Modulos (só Windows)
+DB_LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
+DBPARAMS_HOST_RE = re.compile(r"^[A-Za-z0-9._-]{1,255}$")
+
+
+def dbparams_paths(base):
+    """Onde procurar o DBParams.ini: ao lado da pasta do agente (C:\C2Tecnologia\ServerMonitor → ..\Modulos) e na
+    pasta padrão do disco do sistema. Fora do Windows, nenhum (o banco do Linux é local)."""
+    if DBPARAMS_PATHS is not None:
+        return list(DBPARAMS_PATHS)
+    if not IS_WINDOWS:
+        return []
+    out = [os.path.join(os.path.dirname(os.path.abspath(base)), "Modulos", DBPARAMS_FILE)]
+    p = (os.environ.get("SystemDrive") or "C:") + "\\C2Tecnologia\\Modulos\\" + DBPARAMS_FILE
+    if p.lower() not in [x.lower() for x in out]:
+        out.append(p)
+    return out
+
+
+def dbparams_read(path):
+    """(host, porta ou None) do 1º `host=` ativo da seção [conexao] (linhas com # ou ; são comentário; `host:porta`
+    aceito) ou None (sem arquivo, sem host, host com caracteres inesperados)."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read(65536)
+    except OSError:
+        return None
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = data.decode("latin-1")
+    sec = ""
+    for line in text.splitlines():
+        t = line.strip()
+        if not t or t[0] in "#;":
+            continue
+        if t.startswith("[") and t.endswith("]"):
+            sec = t[1:-1].strip().lower()
+            continue
+        if sec != "conexao" or "=" not in t:
+            continue
+        k, v = t.split("=", 1)
+        if k.strip().lower() != "host":
+            continue
+        v, port = v.strip().strip('"').strip(), None
+        m = re.match(r"^(.+):(\d{1,5})$", v)
+        if m and 1 <= int(m.group(2)) <= 65535:
+            v, port = m.group(1), int(m.group(2))
+        return (v, port) if DBPARAMS_HOST_RE.match(v) else None
+    return None
+
+
+def dbparams_host(paths):
+    """(host, porta ou None, arquivo) do primeiro DBParams.ini legível em `paths` ou None."""
+    for p in paths:
+        r = dbparams_read(p)
+        if r is not None:
+            return r[0], r[1], p
+    return None
+
+
+def db_cfg_host(cfg, found):
+    """(configuração efetiva, origem do host). O host do DBParams.ini só substitui o padrão local (127.0.0.1/localhost)
+    da central; host próprio gravado para o servidor vale sempre; ini apontando para a própria máquina não muda nada."""
+    host = str(cfg.get("host", "")).strip().lower()
+    if found is None or host not in DB_LOCAL_HOSTS or found[0].lower() in DB_LOCAL_HOSTS:
+        return cfg, "central"
+    out = dict(cfg, host=found[0])
+    if found[1]:
+        out["port"] = found[1]
+    return out, "dbparams"
+
+
 DB_REFRESH = 600                # s entre verificações de db_config/updated_at e db_catalog/sig
 DB_RETRY = 60                   # s até tentar de novo uma leitura do Firebase que falhou
 DB_KEY_CHECK = 5                # s entre verificações (stat) do arquivo da chave (tecla k no --view, --catalogo-chave)
@@ -6036,6 +6112,8 @@ class DbAgent(SseListen):
         self.configured = False           # acesso ativo (desligado: só se existe db_config/{sid})
         self.cfg, self.cfg_at = None, None
         self.cfg_err = None               # (código, mensagem): sem db_config / senha cifrada que não abre
+        self.cfg_base = None              # db_config como veio da central (self.cfg = ele com o host do DBParams.ini)
+        self.host_src = ""                # origem do host em uso: "central" | "dbparams" (v2.25.3)
         self.key, self.key_mtime, self.key_checked = None, None, 0.0
         self.cat_raw, self.cat_sig, self.catalog, self.cat_error, self.cat_forced = None, None, None, "", 0.0
         self.cat_path = os.path.join(cloud.base, SYNC_DIR, DB_CAT_FILE)
@@ -6160,19 +6238,34 @@ class DbAgent(SseListen):
             at = raw.get("updated_at") if isinstance(raw, dict) else None
             if at is not None:
                 self.cfg, self.cfg_err = db_cfg_open(raw, read_catkey(self.key_path), sid)
+                self.cfg_base = self.cfg
                 self.cfg_at = at
                 self.close_pg()
                 self.conn_state, self.server_version = (None, "", ""), ""
                 self.test_pending = self.cfg is not None
         if at is None and (self.cfg is not None or self.cfg_at is not None or self.cfg_err is None):
             # sem db_config/{sid}: sem conexão (v2.24: nenhuma credencial padrão no código); a central precisa gravar
-            self.cfg, self.cfg_at = None, None
+            self.cfg, self.cfg_at, self.cfg_base = None, None, None
             self.cfg_err = ("sem_config", "conexão com o banco ainda não configurada na central (db_config)")
             self.close_pg()
             self.conn_state, self.server_version = (None, "", ""), ""
             self.test_pending = False
+        self.apply_dbparams()
         self.configured = True
         self.listen.set()
+
+    def apply_dbparams(self):
+        """Host do DBParams.ini (v2.25.3), relido a cada refresh (arquivo pequeno): mudou o host/porta efetivo =
+        fecha a conexão e testa de novo. Falhou a conexão no host do ini = erro mostrado, sem tentar o local."""
+        if self.cfg_base is None or self.cfg is None:
+            self.host_src = ""
+            return
+        cfg, self.host_src = db_cfg_host(self.cfg_base, dbparams_host(dbparams_paths(self.cloud.base)))
+        if (cfg.get("host"), cfg.get("port")) != (self.cfg.get("host"), self.cfg.get("port")):
+            self.close_pg()
+            self.conn_state, self.server_version = (None, "", ""), ""
+            self.test_pending = True
+        self.cfg = cfg
 
     def check_key(self, force=False):
         """Relê a chave só se o arquivo mudou (stat a cada DB_KEY_CHECK s): --catalogo-chave em outro terminal."""
@@ -6513,12 +6606,15 @@ class DbAgent(SseListen):
             doc["catalog_version"] = self.catalog["version"]
         if self.enabled and (self.cfg is not None or self.cfg_at is not None or self.cfg_err is not None):
             doc["config_source"] = "central" if self.cfg_at is not None else "sem_config"
+        if self.enabled and self.cfg is not None and self.host_src:
+            doc.update(host_source=self.host_src, db_host=clip(str(self.cfg.get("host", "")), 255))
         if not self.enabled:
             code, msg = "desligado", "acesso ao banco desligado neste servidor (sync.db_access)"
         elif self.cfg_err is not None:
             code, msg = self.cfg_err
         elif ok_conn is False:
-            pass
+            if self.host_src == "dbparams":
+                msg = "%s (host lido do %s)" % (msg, DBPARAMS_FILE)
         elif self.key is None:
             code, msg = "sem_chave", "falta a chave do catálogo no servidor (--catalogo-chave)"
         elif self.catalog is None:
