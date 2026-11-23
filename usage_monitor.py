@@ -106,7 +106,7 @@ except ImportError:
 from array import array
 from xml.sax.saxutils import escape as xml_escape
 
-VERSION = "2.25.4"
+VERSION = "2.25.5"
 # Projeto Firebase da C2 (padrão do --firebase-setup). Não são segredos: a URL só identifica o banco e
 # a chave só identifica o projeto (restrita às APIs de login); o acesso é decidido pelas regras.
 FIREBASE_DB_URL = "https://c2-server-monitor-default-rtdb.firebaseio.com"
@@ -12984,6 +12984,8 @@ MESH_STATUS_EVERY = 6 * 3600           # s: mesh_status regravado mesmo sem muda
 MESH_DL_MAX = 64 << 20                 # bytes: o MeshAgent tem ~3-5 MB
 MESH_DL_TIMEOUT = 60                   # s sem resposta do MeshCentral
 MESH_CMD_TIMEOUT = 300                 # s por -fullinstall/-fulluninstall
+MESH_BLOCK_WAITS = (10, 30)            # s entre novas tentativas quando o Windows nega executar o instalador (v2.25.5:
+                                       # antivírus ainda analisando o arquivo recém-baixado; LFNeto, Windows 10 Pro)
 MESH_INFO_TIMEOUT = 30                 # s por -nodeid/-info/sc/systemctl
 MESH_START_WAIT = 15                   # s esperando o serviço chegar a "rodando" depois de iniciar
 MESH_NODE_WAITS = (5, 15, 30, 60)      # s antes de cada leitura do nodeid depois de instalar (v2.25: o NodeId do
@@ -13189,6 +13191,42 @@ def mesh_exec(args, timeout=MESH_INFO_TIMEOUT, cwd=None):
         return p.returncode, (p.stdout or "").strip()
     except (OSError, subprocess.SubprocessError) as e:
         return 127, str(e)
+
+
+def mesh_denied(rc, out):
+    """O Windows recusou CRIAR o processo (WinError 5 / Acesso negado / Access is denied): antivírus ou política."""
+    return rc == 127 and bool(re.search(r"WinError 5\b|acesso negado|access is denied", out or "", re.I))
+
+
+def win_defender_hits():
+    """Detecções do Microsoft Defender que citam o MeshAgent (nome da ameaça), só leitura (Get-MpThreat). [] se não
+    houver, se o Defender não existir ou se a consulta falhar. Usado só para explicar um bloqueio na central."""
+    rc, out = mesh_exec(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                         "Get-MpThreat | ForEach-Object { $_.ThreatName + '|' + ($_.Resources -join ';') }"], timeout=60)
+    if rc != 0:
+        return []
+    hits = []
+    for line in out.splitlines():
+        name, _, res = line.partition("|")
+        if "mesh" in res.lower() and name.strip() and name.strip() not in hits:
+            hits.append(clip(name.strip(), 80))
+    return hits[:3]
+
+
+def win_av_names():
+    """Antivírus registrados na Central de Segurança do Windows (root\\SecurityCenter2; existe nas edições cliente, como
+    Windows 10 Pro, não no Windows Server). Só leitura; [] se não houver ou falhar. Get-WmiObject: PowerShell 2.0+."""
+    rc, out = mesh_exec(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                         "Get-WmiObject -Namespace root\\SecurityCenter2 -Class AntiVirusProduct | "
+                         "ForEach-Object { $_.displayName }"], timeout=60)
+    if rc != 0:
+        return []
+    names = []
+    for line in out.splitlines():
+        n = clip(line.strip(), 60)
+        if n and n not in names:
+            names.append(n)
+    return names[:3]
 
 
 def mesh_download(url, path, limit=MESH_DL_MAX):
@@ -13615,8 +13653,26 @@ class MeshKeeper:
             if name:                                      # nome do servidor da C2 no MeshCentral, não o hostname
                 cmd.append("--agentName=" + name)
             rc, out = mesh_exec(cmd, timeout=MESH_CMD_TIMEOUT, cwd=self.tmp)
+            for wait in MESH_BLOCK_WAITS if loc.os == "windows" else ():
+                if not mesh_denied(rc, out) or not os.path.isfile(exe) or self.stop_ev.wait(wait):
+                    break
+                self.say("Acesso remoto: o Windows negou executar o instalador; tentando de novo em %d s" % wait)
+                rc, out = mesh_exec(cmd, timeout=MESH_CMD_TIMEOUT, cwd=self.tmp)
+            gone = not os.path.isfile(exe)
         finally:
             shutil.rmtree(self.tmp, ignore_errors=True)
+        if loc.os == "windows" and (mesh_denied(rc, out) or (rc == 127 and gone)):
+            hits = win_defender_hits()
+            others = [n for n in win_av_names() if "defender" not in n.lower()] if not hits else []
+            if hits:
+                why = "Microsoft Defender bloqueou o MeshAgent (%s); libere-o no Defender" % ", ".join(hits)
+            elif others:
+                why = "provável bloqueio do antivírus %s; libere o MeshAgent nele (%s e %s)" % (
+                    " / ".join(others), loc.dir, self.tmp)
+            else:
+                why = "provável antivírus; veja o histórico de proteção do Windows"
+            raise MeshError("bloqueado", "o Windows %s o instalador do MeshAgent: %s" % (
+                "apagou" if gone and not mesh_denied(rc, out) else "negou executar", why))
         if "permissions needed" in out:
             raise MeshError("sem_permissao", "o instalador do MeshAgent pediu permissão de administrador")
         f = loc.facts()
