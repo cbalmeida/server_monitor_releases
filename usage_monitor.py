@@ -30,6 +30,7 @@
 
 import argparse
 import ast
+import atexit
 import base64
 import bisect
 import codecs
@@ -105,7 +106,7 @@ except ImportError:
 from array import array
 from xml.sax.saxutils import escape as xml_escape
 
-VERSION = "2.25.1"
+VERSION = "2.25.2"
 # Projeto Firebase da C2 (padrão do --firebase-setup). Não são segredos: a URL só identifica o banco e
 # a chave só identifica o projeto (restrita às APIs de login); o acesso é decidido pelas regras.
 FIREBASE_DB_URL = "https://c2-server-monitor-default-rtdb.firebaseio.com"
@@ -16197,8 +16198,66 @@ def windows_console():
     tarefa agendada já passa -X utf8)."""
     if not sys.flags.utf8_mode:
         sys.exit(run_child([sys.executable, "-X", "utf8"] + sys.argv))
+    # v2.25.2: o console é do PowerShell/cmd que chamou: a página original volta na saída (senão o PowerShell 4
+    # do 2012 R2 quebra no 1º acento depois). Antes do Windows 10 (conhost antigo) não troca: com 65001 a escrita
+    # de não-ASCII falha (erro 31) — o Python escreve em UTF-16 (WriteConsoleW) de qualquer jeito.
     with contextlib.suppress(Exception):
-        win_dll("kernel32").SetConsoleOutputCP(65001)
+        k32 = win_dll("kernel32")
+        old = k32.GetConsoleOutputCP()
+        if old and old != 65001 and (win_build() or 0) >= WIN10_BUILD and k32.SetConsoleOutputCP(65001):
+            atexit.register(k32.SetConsoleOutputCP, old)
+    sys.stdout, sys.stderr = SafeStream(sys.stdout), SafeStream(sys.stderr)
+
+
+WIN10_BUILD = 10240
+
+
+def win_build():
+    """Build do Windows em execução (None fora do Windows)."""
+    try:
+        return sys.getwindowsversion().build
+    except AttributeError:
+        return None
+
+
+def ascii_text(s):
+    """Texto sem acentos para um console que recusou o original ("ç" → "c"; o resto que não é ASCII vira "?")."""
+    s = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+    return s.encode("ascii", "replace").decode("ascii")
+
+
+class SafeStream:
+    """stdout/stderr no Windows (v2.25.2): escrever no console nunca derruba o programa (um print de "OK" com
+    acento escondia o resultado do cadastro no 2012 R2). Falhou → passa a escrever sem acentos direto no descritor
+    (stream novo: o buffer do antigo pode ter ficado preso com o texto recusado); falhou de novo → descarta."""
+
+    ERRORS = (OSError, ValueError, UnicodeError)
+
+    def __init__(self, stream):
+        self.stream, self.ascii = stream, False
+
+    def fallback(self):
+        self.ascii = True
+        with contextlib.suppress(*self.ERRORS):
+            self.stream = io.TextIOWrapper(io.FileIO(self.stream.fileno(), "w", closefd=False), encoding="ascii",
+                                           errors="replace", line_buffering=True)
+
+    def write(self, text):
+        if not self.ascii:
+            try:
+                return self.stream.write(text)
+            except self.ERRORS:
+                self.fallback()
+        with contextlib.suppress(*self.ERRORS):
+            self.stream.write(ascii_text(text))
+        return len(text)
+
+    def flush(self):
+        with contextlib.suppress(*self.ERRORS):
+            self.stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
 
 
 def service_log(base):
