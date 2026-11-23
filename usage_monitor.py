@@ -106,7 +106,7 @@ except ImportError:
 from array import array
 from xml.sax.saxutils import escape as xml_escape
 
-VERSION = "2.25.3"
+VERSION = "2.25.4"
 # Projeto Firebase da C2 (padrão do --firebase-setup). Não são segredos: a URL só identifica o banco e
 # a chave só identifica o projeto (restrita às APIs de login); o acesso é decidido pelas regras.
 FIREBASE_DB_URL = "https://c2-server-monitor-default-rtdb.firebaseio.com"
@@ -2774,6 +2774,9 @@ def slug(s, maxlen=40):
     return s[:maxlen].strip("-") or "sem-nome"
 
 
+COMPANY_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$")   # o formato de slug(): até 40, sem hífen nas pontas
+
+
 def clean_name(v):
     """Empresa/nome do servidor: espaços colapsados, sem caracteres de controle/formatação, até NAME_MAX."""
     v = "".join(c for c in str(v) if unicodedata.category(c) not in ("Cc", "Cf"))
@@ -2936,10 +2939,12 @@ class Identity:
         self.data["name"] = clean_name(name)
         self.save()
 
-    def rename(self, company=None, name=None):
+    def rename(self, company=None, name=None, company_id=None):
         """Renome pedido pela central (v2.14): troca empresa e/ou nome relendo o arquivo antes (outro processo, como
-        --nome, pode tê-lo mudado). O company_id NUNCA muda: sem ele gravado (instalações antigas), fixa o atual antes
-        de trocar o nome da empresa. Devolve True se algo mudou (repetir o mesmo pedido não grava nada)."""
+        --nome, pode tê-lo mudado). Trocar só o nome da empresa não muda o company_id (sem ele gravado, instalações
+        antigas, fixa o atual antes). v2.25.4: `company_id` explícito = mover o servidor para outra empresa (o grupo da
+        central), pedido só do admin (Cadis-Linux/Colina-Linux instalados no mesmo grupo). Devolve True se algo mudou
+        (repetir o mesmo pedido não grava nada)."""
         d = read_json(self.path)
         d = d if isinstance(d, dict) else dict(self.data)
         self.data = d
@@ -2947,6 +2952,9 @@ class Identity:
         if company is not None and company != self.company:
             d.setdefault("company_id", slug(self.company or "sem-empresa"))
             d["company"] = company
+            changed = True
+        if company_id is not None and company_id != self.company_id:
+            d["company_id"] = company_id
             changed = True
         if name is not None and name != self.name:
             d["name"] = name
@@ -4910,6 +4918,12 @@ class SyncManager:
         if not isinstance(rid, str) or not rid or doc.get("applied_id") == rid:
             return None
         vals, error = {}, ""
+        cid = doc.get("company_id")
+        if cid is not None:
+            if isinstance(cid, str) and COMPANY_ID_RE.match(cid):
+                vals["company_id"] = cid
+            else:
+                error = "grupo da empresa inválido: só letras minúsculas, números e hífen"
         for k in ("company", "name"):
             v = doc.get(k)
             if v is None:
