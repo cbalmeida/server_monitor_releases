@@ -3,7 +3,7 @@
 #                 (Windows 7 / Server 2008 R2 ou mais novo; PowerShell 2.0+)
 #
 #  No PowerShell COMO ADMINISTRADOR (uma linha; funciona no PowerShell 2.0):
-#    $u = "https://api.github.com/repos/cbalmeida/server_monitor_releases/contents/instalar.ps1"; $f = "$env:TEMP\instalar.ps1"; Remove-Item -Force -ErrorAction SilentlyContinue $f; try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072; $w = New-Object Net.WebClient; $w.Headers.Add("User-Agent", "c2"); $w.Headers.Add("Accept", "application/vnd.github.raw"); $w.DownloadFile($u, $f) } catch { foreach ($p in "WinHttp.WinHttpRequest.5.1", "Msxml2.XMLHTTP.6.0") { try { $x = New-Object -ComObject $p; if ($p -like "WinHttp*") { [void]$x.GetType().InvokeMember("Option", "SetProperty", $null, $x, @(9, 2720)) }; $x.Open("GET", $u, $false); $x.SetRequestHeader("Accept", "application/vnd.github.raw"); $x.Send(); if ($x.Status -eq 200) { [IO.File]::WriteAllBytes($f, [byte[]]$x.ResponseBody); break } } catch { } } }; if (Test-Path $f) { powershell -NoProfile -ExecutionPolicy Bypass -File $f } else { Write-Host "Sem TLS 1.2 neste Windows: instale o KB3154518 ou o .NET Framework 4.8 com o WMF 5.1 e rode de novo." -ForegroundColor Red }
+#    $u = "https://api.github.com/repos/cbalmeida/server_monitor_releases/contents/instalar.ps1"; $f = "$env:TEMP\instalar.ps1"; try { [IO.File]::Delete($f) } catch { }; try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072; $w = New-Object Net.WebClient; $w.Headers.Add("User-Agent", "c2"); $w.Headers.Add("Accept", "application/vnd.github.raw"); $w.DownloadFile($u, $f) } catch { foreach ($p in "WinHttp.WinHttpRequest.5.1", "Msxml2.XMLHTTP.6.0") { try { $x = New-Object -ComObject $p; if ($p -like "WinHttp*") { [void]$x.GetType().InvokeMember("Option", "SetProperty", $null, $x, @(9, 2720)) }; $x.Open("GET", $u, $false); $x.SetRequestHeader("Accept", "application/vnd.github.raw"); $x.Send(); if ($x.Status -eq 200) { [IO.File]::WriteAllBytes($f, [byte[]]$x.ResponseBody); break } } catch { } } }; if (Test-Path $f) { powershell -NoProfile -ExecutionPolicy Bypass -File $f } else { Write-Host "Sem TLS 1.2 neste Windows: instale o KB3154518 ou o .NET Framework 4.8 com o WMF 5.1 e rode de novo." -ForegroundColor Red }
 #
 #  Opcoes:  -Dir C:\outra\pasta   (padrao C:\c2\server_monitor)
 #           -Parar                (para o monitor e a tarefa agendada; nao remove nada)
@@ -44,6 +44,9 @@ $PyHash = @{
 function Ok($m)    { Write-Host "  [ok] $m" }
 function Aviso($m) { Write-Host "  [aviso] $m" -ForegroundColor Yellow }
 function Erro($m)  { Write-Host "  [ERRO] $m" -ForegroundColor Red; exit 1 }
+# Remove-Item falha com o %TEMP% em nome curto (C:\Users\NOMECO~1, usuario com espaco) mesmo com
+# SilentlyContinue: o arquivo (com segredo, no caso da configuracao) ficava para tras. DeleteFile aceita o nome curto.
+function Apagar($p) { if ($p) { try { [IO.File]::Delete($p) } catch { } } }
 
 $script:DotNetTls = $false
 function Set-Tls12 {
@@ -194,7 +197,7 @@ if ($Self -and -not $env:INSTALADOR_ATUALIZADO) {
     } catch {
         Aviso "nao consegui verificar atualizacao do instalador ($($_.Exception.Message)); seguindo com esta versao."
     } finally {
-        Remove-Item -Force $novo -ErrorAction SilentlyContinue
+        Apagar $novo
     }
 }
 
@@ -335,7 +338,7 @@ try {
             Write-Host "  aplicando a configuracao recebida (empresa, nome, Firebase, chave do catalogo)..."
             & $Py -X utf8 $Prog --config-json $cfg
             if ($LASTEXITCODE -eq 0) { Ok "configuracao aplicada" } else { Aviso "configuracao incompleta: o monitor pergunta o que faltar." }
-            Remove-Item -Force $cfg -ErrorAction SilentlyContinue
+            Apagar $cfg
         } else {
             Aviso "arquivo de configuracao nao encontrado ($cfg): o monitor pergunta o que faltar."
         }
@@ -386,7 +389,7 @@ $xf = Join-Path $env:TEMP "c2_server_monitor_task.xml"
 [IO.File]::WriteAllText($xf, $xml, [Text.Encoding]::Unicode)       # schtasks /XML espera UTF-16
 $r = cmd /c "schtasks /Create /TN `"$TaskName`" /XML `"$xf`" /F 2>&1"
 $rc = $LASTEXITCODE
-Remove-Item -Force $xf -ErrorAction SilentlyContinue
+Apagar $xf
 if ($rc -ne 0) { Erro "falha ao registrar a tarefa agendada: $r" }
 Ok "registrada (ao iniciar o Windows, como SYSTEM)"
 $r = cmd /c "schtasks /Run /TN `"$TaskName`" 2>&1"
