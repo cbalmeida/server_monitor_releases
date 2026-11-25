@@ -106,7 +106,7 @@ except ImportError:
 from array import array
 from xml.sax.saxutils import escape as xml_escape
 
-VERSION = "2.25.5"
+VERSION = "2.26.0"
 # Projeto Firebase da C2 (padrão do --firebase-setup). Não são segredos: a URL só identifica o banco e
 # a chave só identifica o projeto (restrita às APIs de login); o acesso é decidido pelas regras.
 FIREBASE_DB_URL = "https://c2-server-monitor-default-rtdb.firebaseio.com"
@@ -1688,6 +1688,7 @@ class Monitor:
         self.prof = None                # Profiler (profile do banco pedido pela central), junto com o DbAgent
         self.sql = None                 # SqlEditor (editor SQL remoto, v2.12), junto com o DbAgent
         self.queues = None              # QueueReader (filas ERP, v2.18), junto com o DbAgent
+        self.ostats = None              # OrderStats (estatísticas de pedidos, v2.26), junto com o DbAgent
         self.files = None               # FileReceiver (arquivos enviados pela central, v2.19)
         self.mesh = None                # MeshKeeper (acesso remoto pelo MeshCentral, v2.24)
 
@@ -2065,6 +2066,8 @@ class Monitor:
             self.sysev.stop()
         if self.queues is not None:
             self.queues.stop()
+        if self.ostats is not None:
+            self.ostats.stop()
         if self.prof is not None:
             self.prof.stop()
         if self.files is not None:
@@ -3203,6 +3206,7 @@ SYNC_DEFAULTS = {
     "file_receive": True,        # v2.19: recebe arquivos enviados pela central (recebidos/ e destino opcional)
     "remote_access": True,       # v2.24: acesso remoto pelo MeshCentral conforme a central (false = não mexe no MeshAgent)
     "signals_stream": True,      # v2.25: escuta em tempo real de signals/<sid> (avisos em ~1 s; false = só após o heartbeat)
+    "order_stats": True,         # v2.26: estatísticas de pedidos (esquema c2stat no banco -> stats/<sid>; exige db_access)
 }
 HIST_MIN_GAP = 600               # mudança de estado só antecipa o histórico se o último envio tiver > 10 min
 HB_POLL = 5                      # s entre verificações da thread do heartbeat
@@ -4458,7 +4462,9 @@ AGENT_CFG_INTS = {("biz", "heartbeat_s"): (30, 3600), ("biz", "status_s"): (60, 
                   ("queue", "in_queues"): (1, 10 ** 9), ("queue", "not_queued"): (1, 10 ** 9),
                   ("queue", "wait_s"): (60, 7 * 86400), ("queue", "stale_s"): (30, 86400), ("queue", "crit_factor"): (2, 100),
                   # arquivos enviados pela central (v2.19): limite de banda do download em kbit/s (0 = sem limite)
-                  ("files", "max_kbps"): (0, 10 ** 6)}
+                  ("files", "max_kbps"): (0, 10 ** 6),
+                  # estatísticas de pedidos (v2.26): intervalo do envio de stats/<sid> (padrão ORDER_STATS_SEND)
+                  ("stats", "send_s"): (300, 86400)}
 AGENT_CFG_STRS = (("schedule", "days"), ("schedule", "hours"), ("collect", "biz_hours"), ("update", "window"))
 HOURS_RE = re.compile(r"^([0-9]|1[0-9]|2[0-3])-([0-9]|1[0-9]|2[0-4])$")
 
@@ -4506,6 +4512,8 @@ def agent_cfg_clean(merged, sample=5):
                 ok = hours_range(v) is not None
             elif (sec, k) == ("sql", "relays"):         # editor SQL (v2.12): relays permitidos, em ordem
                 ok = sql_relays_parse(v) is not None
+            elif (sec, k) == ("stats", "enabled"):      # estatísticas de pedidos (v2.26): ligadas pela central
+                ok = isinstance(v, bool)
             else:
                 ok = False                       # campo desconhecido (as regras já recusam)
             if ok:
@@ -9384,6 +9392,935 @@ class QueueReader:
                     r["queues"]["f%d" % fid] = {k: v for k, v in f.items() if v is not None and v != ""}
         pg.simple("ROLLBACK")
         return r
+
+
+# --------------------------------------------------------------------------
+# Estatísticas de pedidos (v2.26; contrato em docs/ESTATISTICAS_PEDIDOS.md e docs/CONTRATO_RTDB.md,
+# "Estatísticas de pedidos"): esquema c2stat no banco do cliente, apurado pelo agente e resumido em stats/{sid}
+# --------------------------------------------------------------------------
+ORDER_STATS_FILE = "order_stats.json"   # SYNC_DIR/order_stats.json: estado (versão, carga, fechamento, envio, erro)
+ORDER_STATS_APP = "c2_estatisticas"     # application_name da conexão (identificável no pg_stat_activity)
+ORDER_STATS_EVERY = 60             # s entre apurações (c2stat.f_apurar) com a carga inicial completa
+ORDER_STATS_BATCH = 20000          # pedidos por chamada de f_apurar (p_lote)
+ORDER_STATS_PAUSE = 2              # s entre lotes da carga inicial
+ORDER_STATS_IO_WAIT = 30           # s de espera antes de um lote da carga inicial com PSI io > PSI_BUSY
+ORDER_STATS_IO_MAX = 600           # s seguidos adiando por PSI io: depois disso roda um lote assim mesmo
+ORDER_STATS_ON = False             # padrão de agent_config stats.enabled: ligar servidor a servidor pela central
+ORDER_STATS_SEND = 900             # s entre envios de stats/{sid} (agent_config stats.send_s; decisão do usuário)
+ORDER_STATS_FULL_EVERY = 6 * 3600  # s: stats/{sid} inteiro pelo menos nesse intervalo; entre eles, só diferenças
+ORDER_STATS_INFO_EVERY = 3600      # s entre leituras de c2stat.f_info() (instalação/atualização do esquema)
+ORDER_STATS_CLOSE_HOURS = (2, 4)   # fechamento noturno (f_fechamento), uma vez por dia, entre 02:00 e 04:00 locais
+ORDER_STATS_FN_MS = 120000         # statement_timeout de f_apurar/f_fechamento
+ORDER_STATS_READ_MS = 30000        # statement_timeout de f_info/f_resumo (só tabelas pequenas)
+ORDER_STATS_INSTALL_MS = 600000    # statement_timeout da instalação do esquema
+ORDER_STATS_LOCK_MS = 500          # lock_timeout de tudo
+ORDER_STATS_BACKOFF = (30, 1800)   # s até tentar de novo depois de falha no banco (dobra até o teto)
+ORDER_STATS_SEND_RETRY = (60, 900)  # s até reenviar depois de falha no Firebase (dobra até o teto)
+ORDER_STATS_WAIT = 30              # s máximos entre verificações da thread (desligado, aguardando, horário)
+ORDER_STATS_SAVE = 600             # s entre gravações do estado só pela hora da apuração
+ORDER_STATS_CITIES_MAX = 6000      # cidades enviadas (o Brasil tem 5.570 municípios)
+ORDER_STATS_TYPES = ("venda", "bonificacao", "troca", "outros")
+ORDER_STATS_WINDOWS = ("h1", "h24", "d7", "d30")
+ORDER_STATS_COUNTS = ("pedidos", "clientes", "rcas", "cidades")
+ORDER_STATS_VALUES = ("valor", "valor_atendido")
+ORDER_STATS_IBGE_RE = re.compile(r"^[0-9]{6,7}$")
+C2STAT_SQL_VERSION = 1             # versão do SQL abaixo (c2stat.f_info().sql_versao menor = reinstala)
+# Instalação/atualização do esquema c2stat (cópia de sql/c2stat_v1.sql), enviada numa Query só (protocolo simples)
+# dentro do BEGIN + SET LOCAL do agente: o BEGIN/COMMIT do próprio script só geram aviso (WARNING) e os timeouts
+# locais valem até o COMMIT dele; erro no meio = nada aplicado (ROLLBACK). Vazio = ainda não incorporado: o agente
+# nunca instala (erro sem_sql).
+C2STAT_SQL = """-- c2stat v1 - estatisticas de pedidos da C2 (variante WinThor)
+-- Contrato e regras em docs/ESTATISTICAS_PEDIDOS.md (server_monitor).
+-- Requisito: PostgreSQL 9.6 (nada de recurso posterior). Texto so em ASCII (bancos LATIN1).
+-- Idempotente: rodar de novo so recria as funcoes; tabelas e dados ficam.
+-- So escreve no esquema c2stat. Le e1.cabpedido_com, e1.sitpedido_com, e1.cliente_com e e1.cidade_com
+-- (sem view: nenhuma dependencia registrada sobre as tabelas de e1, que podem mudar nas atualizacoes do banco).
+
+BEGIN;
+
+-- duas instalacoes ao mesmo tempo esperam uma pela outra
+SELECT pg_advisory_xact_lock(4661225117443047425);
+
+CREATE SCHEMA IF NOT EXISTS c2stat;
+
+-- ---------------------------------------------------------------- tabelas
+CREATE TABLE IF NOT EXISTS c2stat.controle (
+  id               smallint PRIMARY KEY CHECK (id = 1),
+  sql_versao       integer NOT NULL,
+  variante         text NOT NULL,
+  ultimo_cod       integer NOT NULL DEFAULT 0,      -- maior cabpedido_com.cod ja lido
+  max_cod          integer,                         -- max(cod) no inicio da carga inicial
+  carga_completa   boolean NOT NULL DEFAULT false,
+  carga_inicio     timestamptz,
+  carga_fim        timestamptz,
+  ultima_apuracao  timestamptz,
+  fechamento_em    timestamptz,
+  instalado_em     timestamptz NOT NULL DEFAULT now(),
+  atualizado_em    timestamptz NOT NULL DEFAULT now()
+);
+
+-- pedidos com dt_rec_pedido nos ultimos 45 dias, com a contribuicao como foi somada (conta = 0 tambem fica,
+-- para o fechamento achar o pedido que passou a contar)
+CREATE TABLE IF NOT EXISTS c2stat.ped_recente (
+  cod       integer NOT NULL,
+  cod_usr   text NOT NULL,
+  dt        timestamp NOT NULL,
+  emprs     integer NOT NULL,
+  cliente   integer NOT NULL,
+  rca       text NOT NULL,
+  tipo      text NOT NULL,
+  conta     smallint NOT NULL,
+  valor     numeric NOT NULL,
+  valor_at  numeric NOT NULL,
+  ibge      text,                                   -- null = sem cidade
+  PRIMARY KEY (cod, cod_usr)
+);
+CREATE INDEX IF NOT EXISTS ped_recente_dt ON c2stat.ped_recente (dt);
+
+CREATE TABLE IF NOT EXISTS c2stat.ped_dia (
+  dia       date NOT NULL,
+  emprs     integer NOT NULL,
+  tipo      text NOT NULL,
+  pedidos   bigint NOT NULL DEFAULT 0,
+  valor     numeric NOT NULL DEFAULT 0,
+  valor_at  numeric NOT NULL DEFAULT 0,
+  PRIMARY KEY (dia, emprs, tipo)
+);
+
+CREATE TABLE IF NOT EXISTS c2stat.cliente (
+  emprs     integer NOT NULL,
+  cliente   integer NOT NULL,
+  ibge      text,                                   -- cidade do pedido mais recente que tinha cidade
+  primeiro  timestamp,
+  ultimo    timestamp,
+  pedidos   bigint NOT NULL DEFAULT 0,
+  valor     numeric NOT NULL DEFAULT 0,
+  PRIMARY KEY (emprs, cliente)
+);
+
+CREATE TABLE IF NOT EXISTS c2stat.rca (
+  emprs     integer NOT NULL,
+  rca       text NOT NULL,
+  primeiro  timestamp,
+  ultimo    timestamp,
+  pedidos   bigint NOT NULL DEFAULT 0,
+  valor     numeric NOT NULL DEFAULT 0,
+  PRIMARY KEY (emprs, rca)
+);
+
+CREATE TABLE IF NOT EXISTS c2stat.cidade (
+  ibge      text PRIMARY KEY,
+  nome      text,
+  uf        text,
+  primeiro  timestamp,
+  ultimo    timestamp,
+  pedidos   bigint NOT NULL DEFAULT 0,
+  valor     numeric NOT NULL DEFAULT 0,
+  valor_at  numeric NOT NULL DEFAULT 0
+);
+
+-- um pedido classificado (mesma ordem de ped_recente + nome/uf da cidade)
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+                 WHERE n.nspname = 'c2stat' AND t.typname = 't_ped') THEN
+    CREATE TYPE c2stat.t_ped AS (
+      cod integer, cod_usr text, dt timestamp, emprs integer, cliente integer, rca text, tipo text,
+      conta smallint, valor numeric, valor_at numeric, ibge text, nome text, uf text);
+  END IF;
+END $$;
+
+INSERT INTO c2stat.controle (id, sql_versao, variante) VALUES (1, 1, 'winthor') ON CONFLICT (id) DO NOTHING;
+UPDATE c2stat.controle SET sql_versao = 1, variante = 'winthor', atualizado_em = now() WHERE id = 1;
+
+-- ---------------------------------------------------------------- auxiliares
+
+-- "agora" das regras (hora local, como dt_rec_pedido). Testes podem fixar com SET LOCAL c2stat.agora = '...'.
+CREATE OR REPLACE FUNCTION c2stat.f_agora() RETURNS timestamp LANGUAGE sql STABLE AS $$
+  SELECT coalesce(CAST(nullif(current_setting('c2stat.agora', true), '') AS timestamp), localtimestamp)
+$$;
+
+-- horario ISO 8601 com o deslocamento do fuso da sessao (ex. 2026-11-24T15:00:00-03:00)
+CREATE OR REPLACE FUNCTION c2stat.f_iso(p timestamptz) RETURNS text LANGUAGE sql STABLE AS $$
+  SELECT CASE WHEN p IS NULL THEN NULL ELSE
+    to_char(p, 'YYYY-MM-DD"T"HH24:MI:SS')
+    || CASE WHEN extract(timezone FROM p) < 0 THEN '-' ELSE '+' END
+    || lpad(CAST(abs(CAST(extract(timezone FROM p) AS integer)) / 3600 AS text), 2, '0') || ':'
+    || lpad(CAST(abs(CAST(extract(timezone FROM p) AS integer)) % 3600 / 60 AS text), 2, '0')
+  END
+$$;
+
+-- texto da consulta que le e classifica os pedidos de e1 (filtro e ordem/limite aplicados antes das juncoes)
+CREATE OR REPLACE FUNCTION c2stat.f_sql_origem(p_filtro text, p_resto text DEFAULT '') RETURNS text
+LANGUAGE sql IMMUTABLE AS $f$
+  SELECT format($q$
+    SELECT p.cod, p.cod_usr, p.dt_rec_pedido AS dt, p.cod_emprs AS emprs, p.cod_cliente AS cliente,
+           p.cod_rca AS rca,
+           CAST(CASE WHEN p.cond_venda IN (1, 2, 3, 7, 9, 14) THEN 'venda'
+                     WHEN p.cond_venda IN (5, 44) THEN 'bonificacao'
+                     WHEN p.cond_venda IN (11, 12) THEN 'troca'
+                     ELSE 'outros' END AS text) AS tipo,
+           CAST(CASE WHEN s.postv = 1 AND coalesce(p.flg_orcamento, 0) = 0 THEN 1 ELSE 0 END AS smallint) AS conta,
+           CAST(coalesce(p.vl_tot_p_venda, 0) AS numeric) AS valor,
+           CAST(CASE WHEN coalesce(p.vl_tot_atend_erp, 0) <> 0 THEN p.vl_tot_atend_erp
+                     ELSE coalesce(p.vl_tot_p_venda, 0) END AS numeric) AS valor_at,
+           ci.ibge, ci.nome, ci.uf
+      FROM (SELECT p.cod, p.cod_usr, p.dt_rec_pedido, p.cod_emprs, p.cod_cliente, p.cod_rca, p.cond_venda,
+                   p.sit, p.flg_orcamento, p.vl_tot_p_venda, p.vl_tot_atend_erp
+              FROM e1.cabpedido_com p
+             WHERE %s %s) p
+      LEFT JOIN e1.sitpedido_com s ON s.cod_emprs = p.cod_emprs AND s.cod = p.sit
+      LEFT JOIN e1.cliente_com cl ON cl.cod_emprs = p.cod_emprs AND cl.cod_cliente = p.cod_cliente
+      LEFT JOIN (SELECT DISTINCT ON (c.cod_emprs, c.cod_cidade) c.cod_emprs, c.cod_cidade,
+                        btrim(c.cod_ibge) AS ibge, c.descricao AS nome, c.uf
+                   FROM e1.cidade_com c
+                  WHERE c.cod_rca = '' AND btrim(c.cod_ibge) ~ '^[0-9]{7}$'
+                  ORDER BY c.cod_emprs, c.cod_cidade, c.chave) ci
+             ON ci.cod_emprs = cl.cod_emprs AND ci.cod_cidade = CAST(cl.cod_cidade AS text)
+  $q$, p_filtro, p_resto)
+$f$;
+
+-- soma (p_mais) e subtrai (p_menos) a contribuicao dos pedidos que contam nas tabelas de totais
+CREATE OR REPLACE FUNCTION c2stat.f_aplicar(p_mais c2stat.t_ped[], p_menos c2stat.t_ped[]) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF coalesce(cardinality(p_mais), 0) + coalesce(cardinality(p_menos), 0) = 0 THEN
+    RETURN;
+  END IF;
+
+  WITH m AS (SELECT 1 AS s, x.* FROM unnest(p_mais) x WHERE x.conta = 1
+             UNION ALL SELECT -1, y.* FROM unnest(p_menos) y WHERE y.conta = 1)
+  INSERT INTO c2stat.ped_dia AS t (dia, emprs, tipo, pedidos, valor, valor_at)
+  SELECT CAST(dt AS date), emprs, tipo, sum(s), sum(s * valor), sum(s * valor_at) FROM m GROUP BY 1, 2, 3
+  ON CONFLICT (dia, emprs, tipo) DO UPDATE
+    SET pedidos = t.pedidos + excluded.pedidos, valor = t.valor + excluded.valor,
+        valor_at = t.valor_at + excluded.valor_at;
+
+  WITH m AS (SELECT 1 AS s, x.* FROM unnest(p_mais) x WHERE x.conta = 1
+             UNION ALL SELECT -1, y.* FROM unnest(p_menos) y WHERE y.conta = 1)
+  INSERT INTO c2stat.cliente AS t (emprs, cliente, ibge, primeiro, ultimo, pedidos, valor)
+  SELECT emprs, cliente, max(ibge) FILTER (WHERE s > 0), min(dt) FILTER (WHERE s > 0),
+         max(dt) FILTER (WHERE s > 0), sum(s), sum(s * valor)
+    FROM m GROUP BY 1, 2
+  ON CONFLICT (emprs, cliente) DO UPDATE
+    SET ibge = coalesce(excluded.ibge, t.ibge), primeiro = least(t.primeiro, excluded.primeiro),
+        ultimo = greatest(t.ultimo, excluded.ultimo), pedidos = t.pedidos + excluded.pedidos,
+        valor = t.valor + excluded.valor;
+
+  WITH m AS (SELECT 1 AS s, x.* FROM unnest(p_mais) x WHERE x.conta = 1
+             UNION ALL SELECT -1, y.* FROM unnest(p_menos) y WHERE y.conta = 1)
+  INSERT INTO c2stat.rca AS t (emprs, rca, primeiro, ultimo, pedidos, valor)
+  SELECT emprs, rca, min(dt) FILTER (WHERE s > 0), max(dt) FILTER (WHERE s > 0), sum(s), sum(s * valor)
+    FROM m GROUP BY 1, 2
+  ON CONFLICT (emprs, rca) DO UPDATE
+    SET primeiro = least(t.primeiro, excluded.primeiro), ultimo = greatest(t.ultimo, excluded.ultimo),
+        pedidos = t.pedidos + excluded.pedidos, valor = t.valor + excluded.valor;
+
+  WITH m AS (SELECT 1 AS s, x.* FROM unnest(p_mais) x WHERE x.conta = 1
+             UNION ALL SELECT -1, y.* FROM unnest(p_menos) y WHERE y.conta = 1)
+  INSERT INTO c2stat.cidade AS t (ibge, nome, uf, primeiro, ultimo, pedidos, valor, valor_at)
+  SELECT ibge, max(nome), max(uf), min(dt) FILTER (WHERE s > 0), max(dt) FILTER (WHERE s > 0),
+         sum(s), sum(s * valor), sum(s * valor_at)
+    FROM m WHERE ibge IS NOT NULL GROUP BY 1
+  ON CONFLICT (ibge) DO UPDATE
+    SET nome = coalesce(excluded.nome, t.nome), uf = coalesce(excluded.uf, t.uf),
+        primeiro = least(t.primeiro, excluded.primeiro), ultimo = greatest(t.ultimo, excluded.ultimo),
+        pedidos = t.pedidos + excluded.pedidos, valor = t.valor + excluded.valor,
+        valor_at = t.valor_at + excluded.valor_at;
+END
+$$;
+
+-- percentual da carga inicial
+CREATE OR REPLACE FUNCTION c2stat.f_pct(c c2stat.controle) RETURNS numeric LANGUAGE sql IMMUTABLE AS $$
+  SELECT CASE WHEN c.carga_completa THEN CAST(100 AS numeric)
+              WHEN coalesce(c.max_cod, 0) <= 0 THEN CAST(0 AS numeric)
+              ELSE least(CAST(99.9 AS numeric), round(CAST(c.ultimo_cod AS numeric) * 100 / c.max_cod, 1)) END
+$$;
+
+-- ---------------------------------------------------------------- apuracao (a cada minuto; carga inicial em lotes)
+-- Le cod > ultimo_cod pela PK (ordem de cod, ate p_lote pedidos) e, pelo indice de dt_rec_pedido, os pedidos dos
+-- ultimos 15 min com cod <= ultimo_cod que nao estao em ped_recente (transacao que comitou atrasada).
+-- Transacao curta; nas tabelas de e1 so o ACCESS SHARE da leitura. Chamada concorrente devolve {"ocupado": true}.
+CREATE OR REPLACE FUNCTION c2stat.f_apurar(p_lote integer DEFAULT 20000) RETURNS json LANGUAGE plpgsql AS $$
+DECLARE
+  t0        timestamptz := clock_timestamp();
+  c         c2stat.controle;
+  v_agora   timestamp := c2stat.f_agora();
+  v_corte   timestamp;
+  v_lote    c2stat.t_ped[];
+  v_atras   c2stat.t_ped[];
+  v_todos   c2stat.t_ped[];
+  v_aplicar c2stat.t_ped[];
+  n_lidos   integer;
+  n_atras   integer;
+  n_conta   integer;
+  n_rec     integer;
+  v_maxlido integer;
+  v_fim     boolean;
+BEGIN
+  IF p_lote IS NULL OR p_lote < 1 THEN
+    p_lote := 20000;
+  END IF;
+  IF NOT pg_try_advisory_xact_lock(4661225117443047425) THEN
+    RETURN json_build_object('ocupado', true);
+  END IF;
+  SELECT * INTO c FROM c2stat.controle WHERE id = 1 FOR UPDATE;
+  IF c.max_cod IS NULL THEN
+    SELECT coalesce(max(cod), 0) INTO c.max_cod FROM e1.cabpedido_com;
+    c.carga_inicio := now();
+    UPDATE c2stat.controle SET max_cod = c.max_cod, carga_inicio = c.carga_inicio WHERE id = 1;
+  END IF;
+  v_corte := v_agora - interval '45 days';
+
+  EXECUTE 'SELECT array_agg(CAST(ROW(o.*) AS c2stat.t_ped) ORDER BY o.cod) FROM ('
+          || c2stat.f_sql_origem('p.cod > $1', 'ORDER BY p.cod LIMIT $2') || ') o'
+    INTO v_lote USING c.ultimo_cod, p_lote;
+  EXECUTE 'SELECT array_agg(CAST(ROW(o.*) AS c2stat.t_ped)) FROM ('
+          || c2stat.f_sql_origem('p.dt_rec_pedido >= $1 AND p.cod <= $2 AND NOT EXISTS (SELECT 1 FROM '
+                                 || 'c2stat.ped_recente r WHERE r.cod = p.cod AND r.cod_usr = p.cod_usr)') || ') o'
+    INTO v_atras USING v_agora - interval '15 minutes', c.ultimo_cod;
+
+  n_lidos := coalesce(cardinality(v_lote), 0);
+  n_atras := coalesce(cardinality(v_atras), 0);
+  v_todos := coalesce(v_lote, '{}') || coalesce(v_atras, '{}');
+  v_fim := n_lidos < p_lote;
+
+  IF n_lidos + n_atras > 0 THEN
+    -- grava em ped_recente os da janela e soma so o que entrou agora (o que ja estava la nao conta de novo)
+    WITH ins AS (
+      INSERT INTO c2stat.ped_recente (cod, cod_usr, dt, emprs, cliente, rca, tipo, conta, valor, valor_at, ibge)
+      SELECT x.cod, x.cod_usr, x.dt, x.emprs, x.cliente, x.rca, x.tipo, x.conta, x.valor, x.valor_at, x.ibge
+        FROM unnest(v_todos) x WHERE x.dt >= v_corte
+      ON CONFLICT (cod, cod_usr) DO NOTHING
+      RETURNING cod, cod_usr)
+    SELECT array_agg(x), (SELECT count(*) FROM ins)
+      INTO v_aplicar, n_rec
+      FROM unnest(v_todos) x LEFT JOIN ins ON ins.cod = x.cod AND ins.cod_usr = x.cod_usr
+     WHERE x.dt < v_corte OR ins.cod IS NOT NULL;
+    PERFORM c2stat.f_aplicar(v_aplicar, NULL);
+    SELECT count(*) FILTER (WHERE x.conta = 1) INTO n_conta FROM unnest(v_aplicar) x;
+    SELECT max(x.cod) INTO v_maxlido FROM unnest(v_lote) x;
+  END IF;
+
+  UPDATE c2stat.controle
+     SET ultimo_cod = greatest(ultimo_cod, coalesce(v_maxlido, ultimo_cod)),
+         ultima_apuracao = now(),
+         carga_fim = CASE WHEN NOT carga_completa AND v_fim THEN now() ELSE carga_fim END,
+         carga_completa = carga_completa OR v_fim
+   WHERE id = 1
+  RETURNING * INTO c;
+
+  RETURN json_build_object(
+    'lidos', n_lidos, 'atrasados', n_atras, 'aplicados', coalesce(n_conta, 0), 'recentes', coalesce(n_rec, 0),
+    'ultimo_cod', c.ultimo_cod, 'pendente', NOT v_fim, 'carga_pct', c2stat.f_pct(c),
+    'ms', round(CAST(extract(epoch FROM clock_timestamp() - t0) * 1000 AS numeric), 1));
+END
+$$;
+
+-- ---------------------------------------------------------------- fechamento (a noite)
+-- Rele os ultimos 45 dias pelo indice de dt_rec_pedido (so cod <= ultimo_cod), compara com ped_recente e aplica so
+-- a diferenca: mudou (cancelou, valor atendido, tipo, cidade...), faltava (comitou atrasado) ou sumiu da origem.
+-- Pedido de ped_recente fora da janela de leitura e conferido pela PK (pode ter mudado de data).
+-- Depois tira de ped_recente o que tem mais de 45 dias (congelado).
+CREATE OR REPLACE FUNCTION c2stat.f_fechamento() RETURNS json LANGUAGE plpgsql AS $$
+DECLARE
+  t0        timestamptz := clock_timestamp();
+  c         c2stat.controle;
+  v_corte   timestamp := c2stat.f_agora() - interval '45 days';
+  v_o       c2stat.t_ped[];
+  v_falta   c2stat.t_ped[];
+  v_x       c2stat.t_ped[];
+  v_novos   c2stat.t_ped[];
+  v_altn    c2stat.t_ped[];
+  v_alto    c2stat.t_ped[];
+  v_sumiu   c2stat.t_ped[];
+  n_cong    integer;
+BEGIN
+  IF NOT pg_try_advisory_xact_lock(4661225117443047425) THEN
+    RETURN json_build_object('ocupado', true);
+  END IF;
+  SELECT * INTO c FROM c2stat.controle WHERE id = 1 FOR UPDATE;
+
+  EXECUTE 'SELECT array_agg(CAST(ROW(o.*) AS c2stat.t_ped)) FROM ('
+          || c2stat.f_sql_origem('p.dt_rec_pedido >= $1 AND p.cod <= $2') || ') o'
+    INTO v_o USING v_corte, c.ultimo_cod;
+  v_o := coalesce(v_o, '{}');
+
+  -- da janela em ped_recente que a leitura nao trouxe: procura pela PK
+  SELECT array_agg(CAST(ROW(r.cod, r.cod_usr, r.dt, r.emprs, r.cliente, r.rca, r.tipo, r.conta, r.valor,
+                            r.valor_at, r.ibge, NULL, NULL) AS c2stat.t_ped))
+    INTO v_falta
+    FROM c2stat.ped_recente r LEFT JOIN unnest(v_o) o ON o.cod = r.cod AND o.cod_usr = r.cod_usr
+   WHERE r.dt >= v_corte AND o.cod IS NULL;
+  IF v_falta IS NOT NULL THEN
+    EXECUTE 'SELECT array_agg(CAST(ROW(o.*) AS c2stat.t_ped)) FROM ('
+            || c2stat.f_sql_origem('(p.cod, p.cod_usr) IN (SELECT f.cod, f.cod_usr FROM unnest($1) f)') || ') o'
+      INTO v_x USING v_falta;
+    SELECT array_agg(f) INTO v_sumiu
+      FROM unnest(v_falta) f LEFT JOIN unnest(v_x) x ON x.cod = f.cod AND x.cod_usr = f.cod_usr
+     WHERE x.cod IS NULL;
+    v_o := v_o || coalesce(v_x, '{}');
+  END IF;
+
+  SELECT array_agg(n) FILTER (WHERE r.cod IS NULL),
+         array_agg(n) FILTER (WHERE r.cod IS NOT NULL AND
+           (n.dt, n.emprs, n.cliente, n.rca, n.tipo, n.conta, n.valor, n.valor_at, n.ibge) IS DISTINCT FROM
+           (r.dt, r.emprs, r.cliente, r.rca, r.tipo, r.conta, r.valor, r.valor_at, r.ibge)),
+         array_agg(CAST(ROW(r.cod, r.cod_usr, r.dt, r.emprs, r.cliente, r.rca, r.tipo, r.conta, r.valor,
+                            r.valor_at, r.ibge, NULL, NULL) AS c2stat.t_ped)) FILTER (WHERE r.cod IS NOT NULL AND
+           (n.dt, n.emprs, n.cliente, n.rca, n.tipo, n.conta, n.valor, n.valor_at, n.ibge) IS DISTINCT FROM
+           (r.dt, r.emprs, r.cliente, r.rca, r.tipo, r.conta, r.valor, r.valor_at, r.ibge))
+    INTO v_novos, v_altn, v_alto
+    FROM unnest(v_o) n LEFT JOIN c2stat.ped_recente r ON r.cod = n.cod AND r.cod_usr = n.cod_usr;
+
+  PERFORM c2stat.f_aplicar(coalesce(v_novos, '{}') || coalesce(v_altn, '{}'),
+                           coalesce(v_alto, '{}') || coalesce(v_sumiu, '{}'));
+
+  IF v_altn IS NOT NULL THEN
+    UPDATE c2stat.ped_recente r
+       SET dt = n.dt, emprs = n.emprs, cliente = n.cliente, rca = n.rca, tipo = n.tipo, conta = n.conta,
+           valor = n.valor, valor_at = n.valor_at, ibge = n.ibge
+      FROM unnest(v_altn) n WHERE r.cod = n.cod AND r.cod_usr = n.cod_usr;
+  END IF;
+  IF v_novos IS NOT NULL THEN
+    INSERT INTO c2stat.ped_recente (cod, cod_usr, dt, emprs, cliente, rca, tipo, conta, valor, valor_at, ibge)
+    SELECT n.cod, n.cod_usr, n.dt, n.emprs, n.cliente, n.rca, n.tipo, n.conta, n.valor, n.valor_at, n.ibge
+      FROM unnest(v_novos) n
+    ON CONFLICT (cod, cod_usr) DO NOTHING;
+  END IF;
+  IF v_sumiu IS NOT NULL THEN
+    DELETE FROM c2stat.ped_recente r USING unnest(v_sumiu) f WHERE r.cod = f.cod AND r.cod_usr = f.cod_usr;
+  END IF;
+  DELETE FROM c2stat.ped_recente WHERE dt < v_corte;
+  GET DIAGNOSTICS n_cong = ROW_COUNT;
+
+  UPDATE c2stat.controle SET fechamento_em = now() WHERE id = 1;
+
+  RETURN json_build_object(
+    'lidos', cardinality(v_o), 'novos', coalesce(cardinality(v_novos), 0),
+    'alterados', coalesce(cardinality(v_altn), 0), 'removidos', coalesce(cardinality(v_sumiu), 0),
+    'congelados', n_cong, 'ms', round(CAST(extract(epoch FROM clock_timestamp() - t0) * 1000 AS numeric), 1));
+END
+$$;
+
+-- ---------------------------------------------------------------- leitura
+CREATE OR REPLACE FUNCTION c2stat.f_info() RETURNS json LANGUAGE plpgsql STABLE AS $$
+DECLARE
+  c c2stat.controle;
+BEGIN
+  SELECT * INTO c FROM c2stat.controle WHERE id = 1;
+  RETURN json_build_object(
+    'sql_versao', c.sql_versao, 'variante', c.variante,
+    'carga', json_build_object('completa', c.carga_completa, 'pct', c2stat.f_pct(c),
+                               'ultimo_cod', c.ultimo_cod, 'max_cod', c.max_cod),
+    'ultima_apuracao', c2stat.f_iso(c.ultima_apuracao), 'fechamento_em', c2stat.f_iso(c.fechamento_em));
+END
+$$;
+
+-- resumo no layout c2-stats-v1 (docs/ESTATISTICAS_PEDIDOS.md 6); so tabelas pequenas, janelas de ped_recente
+CREATE OR REPLACE FUNCTION c2stat.f_resumo() RETURNS json LANGUAGE plpgsql STABLE AS $$
+DECLARE
+  c        c2stat.controle;
+  v_agora  timestamp := c2stat.f_agora();
+  a1       timestamp := v_agora - interval '1 hour';
+  a24      timestamp := v_agora - interval '24 hours';
+  a7       timestamp := v_agora - interval '7 days';
+  a30      timestamp := v_agora - interval '30 days';
+  v_total  json;
+  v_jan    json;
+  v_cid    json;
+  v_sem    json;
+BEGIN
+  SELECT * INTO c FROM c2stat.controle WHERE id = 1;
+
+  WITH d AS (SELECT tipo, sum(pedidos) AS pedidos, sum(valor) AS valor, sum(valor_at) AS valor_at,
+                    min(dia) FILTER (WHERE pedidos > 0) AS desde
+               FROM c2stat.ped_dia GROUP BY tipo),
+       tp AS (SELECT t.o, t.tipo, coalesce(d.pedidos, 0) AS pedidos, coalesce(d.valor, 0) AS valor
+                FROM unnest(ARRAY['venda', 'bonificacao', 'troca', 'outros']) WITH ORDINALITY t(tipo, o)
+                LEFT JOIN d ON d.tipo = t.tipo)
+  SELECT json_build_object(
+           'pedidos', CAST(coalesce(sum(d.pedidos), 0) AS bigint),
+           'valor', round(coalesce(sum(d.valor), 0), 2),
+           'valor_atendido', round(coalesce(sum(d.valor_at), 0), 2),
+           'clientes', (SELECT count(*) FROM c2stat.cliente WHERE pedidos > 0),
+           'rcas', (SELECT count(*) FROM c2stat.rca WHERE pedidos > 0),
+           'cidades', (SELECT count(*) FROM c2stat.cidade WHERE pedidos > 0),
+           'desde', to_char(min(d.desde), 'YYYY-MM-DD'),
+           'por_tipo', (SELECT json_object_agg(tp.tipo, json_build_object('pedidos', CAST(tp.pedidos AS bigint),
+                                                                          'valor', round(tp.valor, 2))
+                                               ORDER BY tp.o)
+                          FROM tp))
+    INTO v_total FROM d;
+
+  WITH r AS (SELECT dt, valor, valor_at, ibge, emprs || '|' || cliente AS cli, emprs || '|' || rca AS vend
+               FROM c2stat.ped_recente WHERE conta = 1 AND dt >= a30),
+       j AS (SELECT k.o, k.nome, k.desde FROM (VALUES (1, 'h1', a1), (2, 'h24', a24), (3, 'd7', a7), (4, 'd30', a30))
+                                         k(o, nome, desde))
+  SELECT json_object_agg(j.nome, (
+           SELECT json_build_object('pedidos', count(*), 'valor', round(coalesce(sum(r.valor), 0), 2),
+                                    'valor_atendido', round(coalesce(sum(r.valor_at), 0), 2),
+                                    'clientes', count(DISTINCT r.cli), 'rcas', count(DISTINCT r.vend),
+                                    'cidades', count(DISTINCT r.ibge))
+             FROM r WHERE r.dt >= j.desde) ORDER BY j.o)
+    INTO v_jan FROM j;
+
+  WITH w AS (SELECT ibge, count(*) FILTER (WHERE dt >= a1) AS h1, count(*) FILTER (WHERE dt >= a24) AS h24,
+                    count(*) FILTER (WHERE dt >= a7) AS d7, count(*) AS d30
+               FROM c2stat.ped_recente WHERE conta = 1 AND dt >= a30 AND ibge IS NOT NULL GROUP BY ibge),
+       k AS (SELECT ibge, count(*) AS clientes FROM c2stat.cliente
+              WHERE pedidos > 0 AND ibge IS NOT NULL GROUP BY ibge)
+  SELECT coalesce(json_agg(json_build_object(
+           'ibge', ci.ibge, 'nome', ci.nome, 'uf', ci.uf, 'pedidos', ci.pedidos, 'valor', round(ci.valor, 2),
+           'clientes', coalesce(k.clientes, 0), 'ultimo', c2stat.f_iso(CAST(ci.ultimo AS timestamptz)),
+           'h1', coalesce(w.h1, 0), 'h24', coalesce(w.h24, 0), 'd7', coalesce(w.d7, 0), 'd30', coalesce(w.d30, 0))
+           ORDER BY ci.ibge), '[]')
+    INTO v_cid
+    FROM c2stat.cidade ci LEFT JOIN w ON w.ibge = ci.ibge LEFT JOIN k ON k.ibge = ci.ibge
+   WHERE ci.pedidos > 0;
+
+  SELECT json_build_object('pedidos', CAST((SELECT coalesce(sum(pedidos), 0) FROM c2stat.ped_dia)
+                                           - (SELECT coalesce(sum(pedidos), 0) FROM c2stat.cidade) AS bigint),
+                           'valor', round((SELECT coalesce(sum(valor), 0) FROM c2stat.ped_dia)
+                                          - (SELECT coalesce(sum(valor), 0) FROM c2stat.cidade), 2))
+    INTO v_sem;
+
+  RETURN json_build_object(
+    'layout', 'c2-stats-v1', 'sql_versao', c.sql_versao, 'variante', c.variante,
+    'gerado_em', c2stat.f_iso(CAST(v_agora AS timestamptz)),
+    'carga', json_build_object('completa', c.carga_completa, 'pct', c2stat.f_pct(c)),
+    'fechamento_em', c2stat.f_iso(c.fechamento_em),
+    'total', v_total, 'janelas', v_jan, 'cidades', v_cid, 'sem_cidade', v_sem);
+END
+$$;
+
+COMMIT;
+"""
+C2STAT_Q_INFO = "SELECT c2stat.f_info()::text"
+C2STAT_Q_APURAR = "SELECT c2stat.f_apurar($1::int)::text"
+C2STAT_Q_FECHAMENTO = "SELECT c2stat.f_fechamento()::text"
+C2STAT_Q_RESUMO = "SELECT c2stat.f_resumo()::text"
+C2STAT_MISSING = ("3F000", "42883", "42P01")   # esquema, função ou tabela inexistente = instalar
+
+
+def ostat_num(v):
+    """Valor em reais (ou %) do JSON -> número finito com 2 casas (0 se ausente/ilegível)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+        return 0
+    try:
+        f = float(v)
+    except ValueError:
+        return 0
+    if not math.isfinite(f):
+        return 0
+    f = round(f, 2)
+    return int(f) if f == int(f) and abs(f) < 2 ** 53 else f
+
+
+def ostat_int(v):
+    """Contagem -> inteiro >= 0 (0 se ausente/ilegível)."""
+    n = ostat_num(v)
+    return max(0, int(n)) if abs(n) < 2 ** 53 else 0
+
+
+def ostat_txt(v, n):
+    return clip(v, n) if isinstance(v, str) else ""
+
+
+def ostat_block(d, counts=ORDER_STATS_COUNTS, values=ORDER_STATS_VALUES):
+    d = d if isinstance(d, dict) else {}
+    out = {k: ostat_int(d.get(k)) for k in counts}
+    out.update((k, ostat_num(d.get(k))) for k in values)
+    return out
+
+
+def ostat_carga(d):
+    d = d if isinstance(d, dict) else {}
+    return {"completa": d.get("completa") is True, "pct": max(0, min(100, ostat_num(d.get("pct"))))}
+
+
+def order_stats_doc(r, info):
+    """Resumo de c2stat.f_resumo() (layout c2-stats-v1) -> stats/{sid} no formato fechado das regras: números
+    normalizados, textos por clip e as cidades como mapa cidades/{ibge} (ibge inválido fica de fora)."""
+    r = r if isinstance(r, dict) else {}
+    tot = r.get("total") if isinstance(r.get("total"), dict) else {}
+    total = ostat_block(tot)
+    if ostat_txt(tot.get("desde"), 40):
+        total["desde"] = ostat_txt(tot.get("desde"), 40)
+    pt = tot.get("por_tipo") if isinstance(tot.get("por_tipo"), dict) else {}
+    total["por_tipo"] = {t: ostat_block(pt.get(t), ("pedidos",), ("valor",)) for t in ORDER_STATS_TYPES}
+    jan = r.get("janelas") if isinstance(r.get("janelas"), dict) else {}
+    doc = {"layout": ostat_txt(r.get("layout"), 32) or "c2-stats-v1", "sql_versao": ostat_int(r.get("sql_versao")),
+           "variante": ostat_txt(r.get("variante"), 32), "gerado_em": ostat_txt(r.get("gerado_em"), 40),
+           "carga": ostat_carga(r.get("carga")), "total": total,
+           "janelas": {w: ostat_block(jan.get(w)) for w in ORDER_STATS_WINDOWS},
+           "sem_cidade": ostat_block(r.get("sem_cidade"), ("pedidos",), ("valor",)), "info": info,
+           "at": {".sv": "timestamp"}}
+    if ostat_txt(r.get("fechamento_em"), 40):
+        doc["fechamento_em"] = ostat_txt(r.get("fechamento_em"), 40)
+    cities = {}
+    for c in r.get("cidades") if isinstance(r.get("cidades"), list) else ():
+        ibge = str(c.get("ibge") or "").strip() if isinstance(c, dict) else ""
+        if not ORDER_STATS_IBGE_RE.match(ibge) or len(cities) >= ORDER_STATS_CITIES_MAX:
+            continue
+        e = {"nome": ostat_txt(c.get("nome"), 128), "uf": ostat_txt(c.get("uf"), 8), "pedidos": ostat_int(c.get("pedidos")),
+             "valor": ostat_num(c.get("valor")), "clientes": ostat_int(c.get("clientes"))}
+        if ostat_txt(c.get("ultimo"), 40):
+            e["ultimo"] = ostat_txt(c.get("ultimo"), 40)
+        e.update((w, ostat_int(c.get(w))) for w in ORDER_STATS_WINDOWS)
+        cities[rtdb_key(ibge)] = e
+    if cities:
+        doc["cidades"] = cities
+    return doc
+
+
+class OrderStats:
+    """Thread 'estatisticas' (v2.26): estatísticas de pedidos no esquema c2stat do banco do cliente.
+    Conexão própria (ORDER_STATS_APP, com a configuração do DbAgent) mantida aberta enquanto der certo; cada chamada
+    numa transação curta com statement_timeout e lock_timeout. Diferente das outras threads, ESTA conexão escreve,
+    mas só no esquema c2stat e só pelas funções dele (nunca em e1/admin). Só com Firebase, sync.db_access e
+    sync.order_stats (padrão true) e a configuração já lida pelo DbAgent.
+    - Na partida e a cada ORDER_STATS_INFO_EVERY: c2stat.f_info(); ausente ou versão menor que C2STAT_SQL_VERSION =
+      instala C2STAT_SQL numa transação (falha = erro no estado e nova tentativa com espera crescente).
+    - f_apurar(ORDER_STATS_BATCH) a cada ORDER_STATS_EVERY; com a carga inicial incompleta, lotes seguidos com
+      ORDER_STATS_PAUSE entre eles, adiados enquanto o PSI io passa de PSI_BUSY (até ORDER_STATS_IO_MAX seguidos).
+    - f_fechamento() uma vez por dia entre 02:00 e 04:00 locais (data no estado), só com a carga completa.
+    - f_resumo() + stats/{sid} a cada stats.send_s (agent_config; padrão ORDER_STATS_SEND), por diferença como o
+      status: inteiro na 1ª vez do processo e a cada ORDER_STATS_FULL_EVERY; sem pedido nenhum não envia.
+    Estado em SYNC_DIR/order_stats.json (atômico, 600): o --diagnostico mostra."""
+
+    def __init__(self, cloud, db, acfg=None, out=None):
+        self.cloud, self.live, self.ident, self.db, self.acfg, self.out = cloud, cloud.live, cloud.ident, db, acfg, out
+        self.sid = self.ident.install_id
+        self.path = os.path.join(cloud.dir, ORDER_STATS_FILE)
+        self.stop_ev = threading.Event()
+        self.thread = self.pg = self.pg_key = None
+        self.st = self.load()
+        self.fails, self.retry_at = 0, 0.0
+        self.info_at = self.apurar_at = self.send_at = 0.0
+        self.io_since = None              # início dos adiamentos seguidos da carga por PSI io
+        self.load_said = False            # já avisou que a carga inicial está em andamento (neste processo)
+        self.send_fails = 0
+        self.sent = None                  # (canon dos campos, canon das cidades, hora do último envio inteiro)
+        self.saved_at = 0.0
+
+    # ---- estado ----
+    def load(self):
+        d = read_json(self.path)
+        d = d if isinstance(d, dict) else {}
+        st = {"sql_versao": ostat_int(d.get("sql_versao")), "variante": ostat_txt(d.get("variante"), 32),
+              "carga": ostat_carga(d.get("carga"))}
+        for k in ("fechamento_dia", "error_code", "error", "state"):
+            st[k] = d[k] if isinstance(d.get(k), str) else ""
+        for k in ("apurado_at", "fechamento_at", "enviado_at", "instalado_at"):
+            st[k] = d[k] if is_num(d.get(k)) else 0
+        return st
+
+    def save(self, force=True):
+        if not force and time.time() - self.saved_at < ORDER_STATS_SAVE:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.path), mode=0o700, exist_ok=True)
+            write_private(self.path, json.dumps(self.st, separators=(",", ":"), ensure_ascii=False))
+            self.saved_at = time.time()
+        except OSError:
+            pass                          # só o diagnóstico perde: tenta de novo na próxima mudança
+
+    def set_state(self, state, code="", msg=""):
+        new = (state, code, clip(msg, 500) if msg else "")
+        if new != (self.st["state"], self.st["error_code"], self.st["error"]):
+            self.st["state"], self.st["error_code"], self.st["error"] = new
+            self.save()
+
+    def say(self, s):
+        if self.out:
+            self.out(s)
+
+    # ---- ciclo de vida ----
+    def start(self):
+        self.thread = threading.Thread(target=self.loop, name="estatisticas", daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_ev.set()
+        if self.thread is not None and self.thread is not threading.current_thread():
+            self.thread.join(5)
+        self.close_pg()
+
+    def close_pg(self):
+        if self.pg is not None:
+            self.pg.close()
+            self.pg = None
+
+    def loop(self):
+        while not self.stop_ev.is_set():
+            try:
+                wait = self.step()
+            except Exception as e:                        # nunca derruba a thread
+                self.close_pg()
+                self.set_state("erro", "interno", "erro interno: %s" % type(e).__name__)
+                wait = self.fail(time.time())
+            self.stop_ev.wait(max(0.05, min(wait, ORDER_STATS_WAIT)))
+
+    def fail(self, now):
+        self.fails += 1
+        self.retry_at = now + min(ORDER_STATS_BACKOFF[1], ORDER_STATS_BACKOFF[0] * 2 ** (self.fails - 1))
+        return self.retry_at - now
+
+    def send_every(self):
+        return self.acfg.get("stats", "send_s", ORDER_STATS_SEND) if self.acfg is not None else ORDER_STATS_SEND
+
+    def enabled(self):
+        return self.acfg.get("stats", "enabled", ORDER_STATS_ON) is True if self.acfg is not None else ORDER_STATS_ON
+
+    def step(self, now=None):
+        """Faz o que estiver na hora. Devolve os s até a próxima tarefa (o laço espera no máximo ORDER_STATS_WAIT)."""
+        now = time.time() if now is None else now
+        cfg = self.ident.sync_cfg()
+        if not (cfg["order_stats"] and cfg["db_access"]):
+            self.close_pg()
+            self.set_state("desligado", "desligado", "estatísticas de pedidos desligadas neste servidor (sync.%s)"
+                           % ("order_stats" if not cfg["order_stats"] else "db_access"))
+            return ORDER_STATS_WAIT
+        if not self.enabled():
+            self.close_pg()
+            self.set_state("desligado", "central", "estatísticas de pedidos não ligadas pela central "
+                           "(agent_config stats.enabled)")
+            return ORDER_STATS_WAIT
+        c = self.db.cfg
+        if c is None:                                     # o DbAgent ainda não leu db_config/{sid}
+            return ORDER_STATS_WAIT
+        key = tuple(c.get(k) for k in ("host", "port", "dbname", "user", "password", "sslmode"))
+        if key != self.pg_key:                            # configuração nova: conecta de novo e confere o esquema
+            self.close_pg()
+            self.pg_key, self.fails, self.retry_at, self.info_at = key, 0, 0.0, 0.0
+        if now < self.retry_at:
+            return self.retry_at - now
+        try:
+            if now >= self.info_at:
+                self.check_schema(c, now)
+            if now >= self.apurar_at:
+                self.apurar(c, now)
+            if self.close_due(now):
+                self.fechamento(c, now)
+            if now >= self.send_at:
+                self.send(c, now)
+        except DbError as e:
+            self.close_pg()
+            code = SysEvents.db_code(e)
+            self.set_state("erro", code if re.match(r"^[a-z_]{1,64}$", code) else "interno", str(e))
+            return self.fail(now)
+        self.fails = 0
+        if self.st["state"] in ("", "erro", "desligado"):
+            self.set_state("ok")
+        return max(0.0, min(self.info_at, self.apurar_at, self.send_at) - now)
+
+    # ---- Postgres ----
+    def conn(self, c):
+        if self.pg is None:
+            self.pg = PgConn(c.get("host"), c.get("port"), c.get("dbname") or "", c.get("user") or "",
+                             c.get("password") or "", c.get("sslmode"), timeout=10, app=ORDER_STATS_APP)
+        return self.pg
+
+    def conn_for(self, c, ms):
+        """Conexão aberta com o tempo de espera do socket para uma chamada de até ms (socket morto = DbError)."""
+        pg = self.conn(c)
+        try:
+            pg.sock.settimeout(ms / 1000.0 + 10)
+        except OSError as e:
+            self.close_pg()
+            raise DbError("conexao", "conexão com o PostgreSQL caiu (%s)" % (e.strerror or e), broken=True)
+        return pg
+
+    def call(self, c, sql, params, ms):
+        """Uma função do c2stat numa transação curta (statement/lock_timeout locais); devolve o JSON (dict)."""
+        pg = self.conn_for(c, ms)
+        try:
+            pg.simple("BEGIN; SET LOCAL statement_timeout = %d; SET LOCAL lock_timeout = %d" % (ms, ORDER_STATS_LOCK_MS))
+            rows = pg.query(sql, params, 1, DB_MAX_MSG)[2]
+            pg.simple("COMMIT")
+        except DbError as e:
+            if e.broken:
+                self.close_pg()
+            else:
+                with contextlib.suppress(DbError):
+                    pg.simple("ROLLBACK")
+            raise
+        try:
+            v = json.loads(rows[0][0]) if rows and rows[0][0] is not None else None
+        except ValueError:
+            v = None
+        if not isinstance(v, dict):
+            raise DbError("resposta_invalida", "resposta inválida de %s" % sql.split()[1].split("(")[0])
+        return v
+
+    def info(self, c):
+        try:
+            return self.call(c, C2STAT_Q_INFO, [], ORDER_STATS_READ_MS)
+        except DbError as e:
+            if e.sqlstate in C2STAT_MISSING:
+                return None
+            raise
+
+    def install(self, c):
+        """C2STAT_SQL numa transação só (protocolo simples, várias instruções). Falha = ROLLBACK e DbError."""
+        pg = self.conn_for(c, ORDER_STATS_INSTALL_MS)
+        pg.simple("BEGIN; SET LOCAL statement_timeout = %d; SET LOCAL lock_timeout = %d"
+                  % (ORDER_STATS_INSTALL_MS, ORDER_STATS_LOCK_MS))
+        err = pg.script(C2STAT_SQL)[3]
+        if err is not None:
+            with contextlib.suppress(DbError):
+                pg.simple("ROLLBACK")
+            raise DbError("instalacao", "falha ao instalar o esquema c2stat: %s" % err)
+        pg.simple("COMMIT")
+
+    def check_schema(self, c, now):
+        info = self.info(c)
+        have = ostat_int(info.get("sql_versao")) if info is not None else 0
+        if info is None or have < C2STAT_SQL_VERSION:
+            if not C2STAT_SQL.strip():
+                raise DbError("sem_sql", "este agente não traz o SQL de instalação do esquema c2stat")
+            self.say("Estatísticas de pedidos: %s o esquema c2stat (versão %d)..." % (
+                "instalando" if info is None else "atualizando de %d para" % have, C2STAT_SQL_VERSION))
+            self.install(c)
+            info = self.info(c)
+            have = ostat_int(info.get("sql_versao")) if info is not None else 0
+            if have < C2STAT_SQL_VERSION:
+                raise DbError("instalacao", "esquema c2stat instalado, mas f_info() informa a versão %d" % have)
+            self.st["instalado_at"] = int(now * 1000)
+            self.say("Estatísticas de pedidos: esquema c2stat versão %d instalado." % have)
+        self.st.update(sql_versao=have, variante=ostat_txt(info.get("variante"), 32))
+        if isinstance(info.get("carga"), dict):
+            self.st["carga"] = ostat_carga(info["carga"])
+        self.info_at = now + ORDER_STATS_INFO_EVERY
+        self.save()
+
+    def apurar(self, c, now):
+        if not self.st["carga"]["completa"] and self.st["apurado_at"]:
+            psi = io_pressure()                           # carga inicial: não compete com um disco ocupado
+            if psi is not None and psi > PSI_BUSY:
+                self.io_since = self.io_since or now
+                if now - self.io_since < ORDER_STATS_IO_MAX:
+                    self.apurar_at = now + ORDER_STATS_IO_WAIT
+                    return "adiado"
+            self.io_since = None
+        r = self.call(c, C2STAT_Q_APURAR, [str(ORDER_STATS_BATCH)], ORDER_STATS_FN_MS)
+        if r.get("ocupado") is True:                      # outra apuração no mesmo banco (trava advisory do c2stat)
+            self.apurar_at = now + ORDER_STATS_EVERY
+            return "ocupado"
+        was = self.st["carga"]["completa"]
+        more = r.get("pendente") is True                  # sobrou pedido além do lote: o próximo vem logo
+        if isinstance(r.get("carga"), dict):
+            self.st["carga"] = ostat_carga(r["carga"])
+            more = more or not self.st["carga"]["completa"]
+        elif "pendente" in r or "carga_pct" in r:         # f_apurar do c2stat v1: pendente + carga_pct
+            self.st["carga"] = ostat_carga({"completa": was or not more,
+                                            "pct": r.get("carga_pct", self.st["carga"]["pct"])})
+        else:
+            more = not was
+        done = self.st["carga"]["completa"]
+        self.st["apurado_at"] = int(now * 1000)
+        self.apurar_at = now + (ORDER_STATS_PAUSE if more else ORDER_STATS_EVERY)
+        if done and not was:
+            self.say("Estatísticas de pedidos: carga inicial concluída.")
+        elif not done and not self.load_said:
+            self.say("Estatísticas de pedidos: carga inicial em andamento (%s%%; lotes de %d pedidos)."
+                     % (self.st["carga"]["pct"], ORDER_STATS_BATCH))
+        self.load_said = not done
+        self.save(force=done != was)
+        return "ok"
+
+    def close_due(self, now):
+        lt = time.localtime(now)
+        return (self.st["carga"]["completa"] and ORDER_STATS_CLOSE_HOURS[0] <= lt.tm_hour < ORDER_STATS_CLOSE_HOURS[1]
+                and self.st["fechamento_dia"] != time.strftime("%Y-%m-%d", lt))
+
+    def fechamento(self, c, now):
+        if self.call(c, C2STAT_Q_FECHAMENTO, [], ORDER_STATS_FN_MS).get("ocupado") is True:
+            return "ocupado"                              # outra apuração no mesmo banco: tenta no próximo ciclo
+        self.st["fechamento_dia"] = time.strftime("%Y-%m-%d", time.localtime(now))
+        self.st["fechamento_at"] = int(now * 1000)
+        self.say("Estatísticas de pedidos: fechamento do dia feito.")
+        self.save()
+        return "ok"
+
+    # ---- Firebase ----
+    def info_doc(self):
+        d = {"agent_version": VERSION, "sql_versao": self.st["sql_versao"], "sql_agente": C2STAT_SQL_VERSION,
+             "variante": self.st["variante"], "carga": dict(self.st["carga"]), "apurado_at": int(self.st["apurado_at"])}
+        if self.st["fechamento_dia"]:
+            d.update(fechamento_dia=self.st["fechamento_dia"], fechamento_at=int(self.st["fechamento_at"]))
+        return d
+
+    def entries(self, doc, now):
+        """stats/{sid} inteiro (1º envio do processo, a cada ORDER_STATS_FULL_EVERY) ou só os campos de 1º nível e
+        as cidades que mudaram desde o último envio confirmado (como CloudSync.status_entries); .sv vai sempre,
+        sumido = null. Devolve (entries, o que vira self.sent quando o envio for confirmado)."""
+        base = "stats/" + self.sid
+        dump = lambda v: json.dumps(v, sort_keys=True, separators=(",", ":"))
+        canon = {k: dump(v) for k, v in doc.items() if k != "cidades"}
+        cities = {k: dump(v) for k, v in (doc.get("cidades") or {}).items()}
+        prev = self.sent
+        if prev is None or now - prev[2] >= ORDER_STATS_FULL_EVERY:
+            return {base: doc}, (canon, cities, now)
+        out = {}
+        for k, v in canon.items():
+            if v != prev[0].get(k) or '".sv"' in v:
+                out["%s/%s" % (base, k)] = doc[k]
+        for k in prev[0]:
+            if k not in canon:
+                out["%s/%s" % (base, k)] = None
+        for k, v in cities.items():
+            if v != prev[1].get(k):
+                out["%s/cidades/%s" % (base, k)] = doc["cidades"][k]
+        for k in prev[1]:
+            if k not in cities:
+                out["%s/cidades/%s" % (base, k)] = None
+        return out, (canon, cities, prev[2])
+
+    def send(self, c, now):
+        """f_resumo() e stats/{sid}. Devolve vazio (sem pedido: não envia) | ok | erro (Firebase; backoff próprio)."""
+        r = self.call(c, C2STAT_Q_RESUMO, [], ORDER_STATS_READ_MS)
+        self.send_at = now + self.send_every()
+        doc = order_stats_doc(r, self.info_doc())
+        if not doc["total"]["pedidos"]:
+            return "vazio"
+        ent, sent = self.entries(doc, now)
+        try:
+            self.live.patch("", ent, timeout=30)
+        except CloudError as e:
+            self.sent = None                              # próximo envio inteiro
+            self.send_fails += 1
+            self.send_at = now + min(ORDER_STATS_SEND_RETRY[1], ORDER_STATS_SEND_RETRY[0] * 2 ** (self.send_fails - 1))
+            if self.send_fails == 1:
+                self.say("Estatísticas de pedidos: envio falhou (%s); tentando de novo." % e)
+            return "erro"
+        self.sent, self.send_fails = sent, 0
+        self.st["enviado_at"] = int(now * 1000)
+        self.save(force=False)
+        return "ok"
+
+
+def order_stats_report(ident, out=print):
+    """Linha "Estatísticas de pedidos" do --diagnostico (só lê o estado gravado pela thread)."""
+    cfg = ident.sync_cfg()
+    st = read_json(os.path.join(ident.base, SYNC_DIR, ORDER_STATS_FILE))
+    on = cfg["order_stats"] and cfg["db_access"]
+    out("Estatísticas de pedidos (c2stat): %s | SQL do agente v%d%s" % (
+        "liberadas (ligam pela central: agent_config stats.enabled)" if on else "DESLIGADAS (sync.%s)" % (
+            "order_stats" if not cfg["order_stats"] else "db_access"),
+        C2STAT_SQL_VERSION, "" if C2STAT_SQL.strip() else " (SEM o SQL de instalação)"))
+    if not isinstance(st, dict):
+        out("  ainda sem estado (a thread não rodou)")
+        return
+    ms = lambda k: (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st[k] / 1000.0))
+                    if is_num(st.get(k)) and st[k] else "-")
+    carga = st.get("carga") if isinstance(st.get("carga"), dict) else {}
+    out("  esquema no banco: v%s %s | carga inicial: %s | apuração: %s | fechamento: %s | envio: %s" % (
+        st.get("sql_versao") or "-", st.get("variante") or "", "completa" if carga.get("completa") is True
+        else "%s%%" % carga.get("pct", 0), ms("apurado_at"), st.get("fechamento_dia") or "-", ms("enviado_at")))
+    if st.get("error_code"):
+        out("  estado: %s | erro %s: %s" % (st.get("state") or "-", st["error_code"], st.get("error") or ""))
 
 
 # --------------------------------------------------------------------------
@@ -17013,6 +17950,7 @@ def run_diagnostics(log, ident, host, script_dir, out=print):
     except OSError as e:
         out("Banco local (%s:%s): porta fechada ou inacessível (%s)" % (d["host"], d["port"], e))
     run_sql_diagnostics(ident, cfg, ac, out)
+    order_stats_report(ident, out)
     mesh_report(ident, out)
     if IS_WINDOWS:
         sysdir = os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "System32")
@@ -17352,6 +18290,7 @@ def main():
             # filas ERP (v2.18): uma leitura por janela, com a configuração do DbAgent e os limites da central
             mon.queues = cloud.queues = QueueReader(mon.db, mon.next_boundary, cloud.acfg, out=mon.say,
                                                     path=os.path.join(cloud.dir, QUEUE_SEEN_FILE))
+            mon.ostats = OrderStats(cloud, mon.db, cloud.acfg, out=mon.say)   # estatísticas de pedidos (v2.26)
     # autoatualização: só o coletor; ao gravar a versão nova para a coleta e o laço abaixo sai para reiniciar
     mon.updater = Updater(os.path.abspath(__file__), ident.sync_cfg(), out=mon.say, on_restart=mon.stop_ev.set)
     mon.updater.acfg = cloud.acfg                         # intervalo e janela da autoatualização (central)
@@ -17409,6 +18348,12 @@ def main():
             mon.queues.start()
             print("Filas ERP (admin.monitor_filas): %s." % ("lidas a cada janela junto com o acesso ao banco"
                                                            if ident.sync_cfg()["db_access"] else "DESLIGADAS (sync.db_access)"))
+        if mon.ostats is not None:
+            mon.ostats.start()
+            c = ident.sync_cfg()
+            print("Estatísticas de pedidos (esquema c2stat): %s." % (
+                "liberadas (ligam pela central: agent_config stats.enabled)" if c["order_stats"] and c["db_access"]
+                else "DESLIGADAS (sync.%s)" % ("order_stats" if not c["order_stats"] else "db_access")))
         if mon.sysev is not None:
             mon.sysev.start()
             c = ident.sync_cfg()
