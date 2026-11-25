@@ -24,7 +24,7 @@
 #
 #  Feito para Ubuntu 20.04 (Python 3.8, só biblioteca padrão). Na partida
 #  verifica as ferramentas do benchmark (fio, util-linux, coreutils...) e
-#  instala via apt-get as que faltarem (--no-install para pular).
+#  instala via apt-get (ou dnf/yum no Rocky/RHEL) as que faltarem (--no-install para pular).
 #  Sucessor do usage_monitor.sh: o formato do relatório é o mesmo.
 # =============================================================================
 
@@ -106,7 +106,7 @@ except ImportError:
 from array import array
 from xml.sax.saxutils import escape as xml_escape
 
-VERSION = "2.26.1"
+VERSION = "2.26.2"
 # Projeto Firebase da C2 (padrão do --firebase-setup). Não são segredos: a URL só identifica o banco e
 # a chave só identifica o projeto (restrita às APIs de login); o acesso é decidido pelas regras.
 FIREBASE_DB_URL = "https://c2-server-monitor-default-rtdb.firebaseio.com"
@@ -1394,6 +1394,16 @@ LEGEND = """\
 DEPS = [("df", "coreutils"), ("dd", "coreutils"), ("head", "coreutils"), ("sha256sum", "coreutils"),
         ("lsblk", "util-linux"), ("lscpu", "util-linux"), ("uptime", "procps"), ("hostname", "hostname"),
         ("systemd-detect-virt", "systemd"), ("fio", "fio")]
+# pacote apt -> pacote rpm (Rocky/RHEL 8-9, dnf ou yum); o que não está aqui tem o mesmo nome
+DEPS_RPM = {"procps": "procps-ng"}
+
+
+def pkg_manager():
+    """Gerenciador de pacotes do sistema: apt-get (Debian/Ubuntu), dnf ou yum (Rocky/RHEL); None = nenhum."""
+    for pm in ("apt-get", "dnf", "yum"):
+        if shutil.which(pm):
+            return pm
+    return None
 
 
 def check_deps(do_install):
@@ -1401,16 +1411,18 @@ def check_deps(do_install):
     if not missing:
         print("Dependências: OK")
         return
+    pm = pkg_manager()
     pkgs = []
     for _, p in missing:
+        p = DEPS_RPM.get(p, p) if pm in ("dnf", "yum") else p
         if p not in pkgs:
             pkgs.append(p)
     print("Dependências faltando: " + " ".join(c for c, _ in missing))
     if not do_install:
         print("  --no-install: seguindo sem instalar (métricas dependentes ficarão NA).")
         return
-    if not shutil.which("apt-get"):
-        print("  apt-get não encontrado; instale manualmente: " + " ".join(pkgs))
+    if not pm:
+        print("  apt-get/dnf não encontrado; instale manualmente: " + " ".join(pkgs))
         return
     sudo = ""
     if os.geteuid() != 0:
@@ -1418,9 +1430,13 @@ def check_deps(do_install):
             print("  sem root e sem sudo; instale manualmente: " + " ".join(pkgs))
             return
         sudo = "sudo "
-    print("Instalando via apt-get: " + " ".join(pkgs))
-    subprocess.call(sudo + "env DEBIAN_FRONTEND=noninteractive apt-get update -qq", shell=True)
-    if subprocess.call(sudo + "env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq " + " ".join(pkgs), shell=True):
+    print("Instalando via %s: %s" % (pm, " ".join(pkgs)))
+    if pm == "apt-get":
+        subprocess.call(sudo + "env DEBIAN_FRONTEND=noninteractive apt-get update -qq", shell=True)
+        cmd = sudo + "env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "
+    else:
+        cmd = sudo + pm + " install -y -q "
+    if subprocess.call(cmd + " ".join(pkgs), shell=True):
         print("  AVISO: falha ao instalar algum pacote; seguindo assim mesmo.")
     for c, _ in DEPS:
         if not shutil.which(c):
@@ -18176,7 +18192,7 @@ def parse_args():
     p.add_argument("-d", "--bench-dir", metavar="DIR", help="diretório para o teste de disco (padrão: pasta do script) -> aponte para o disco do banco de dados")
     p.add_argument("-m", "--bench-mb", type=int, default=1024, metavar="MB", help="tamanho do teste de disco (padrão 1024)")
     p.add_argument("--no-bench", dest="bench", action="store_false", help="não roda o benchmark (reaproveita capacidades do log)")
-    p.add_argument("--no-install", dest="install", action="store_false", help="não verifica/instala dependências via apt-get")
+    p.add_argument("--no-install", dest="install", action="store_false", help="não verifica/instala dependências via apt-get/dnf")
     p.add_argument("--bench-auto", action="store_true",
                    help="roda o benchmark só se o relatório ainda não tiver um (BENCH); usado pelo serviço do Linux")
     g = p.add_mutually_exclusive_group()

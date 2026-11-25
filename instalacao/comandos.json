@@ -1,6 +1,6 @@
 {
   "formato": 1,
-  "revisao": 4,
+  "revisao": 5,
   "descricao": "Modelos dos comandos de instalação do agente que a central mostra em \"Instalar agente\". Fonte única: mudou o instalar.sh/instalar.ps1 (URL, pasta, opções, pré-requisitos) -> atualize aqui, suba a revisao e copie para a central (assets/instalacao/comandos.json). Marcadores: {{config_json}} (JSON de configuração, uma linha, só ASCII), {{config_bash}}/{{config_ps}} (o mesmo JSON como texto entre aspas simples do bash/PowerShell), {{empresa_bash}}/{{nome_bash}} e {{empresa_ps}}/{{nome_ps}} (argumentos entre aspas simples; no PowerShell com \\\" para o programa nativo). Comando com \"segredo\": true é mascarado na tela.",
   "ambientes": [
     {
@@ -288,6 +288,79 @@
           "id": "diagnostico",
           "titulo": "Diagnóstico (texto para o suporte)",
           "modelo": "cd /home/c2/server_monitor && sudo /usr/local/bin/python3.8 usage_monitor.py --diagnostico"
+        }
+      ]
+    },
+    {
+      "id": "rhel",
+      "nome": "Rocky Linux / RHEL 8 ou 9",
+      "sistema": "linux",
+      "terminal": "PuTTY (SSH)",
+      "sufixo_nome": "Linux",
+      "resumo": "Python do sistema no 9 (3.9) ou python3.11 do dnf no 8 (o python3 3.6 do sistema fica como está); o monitor roda como serviço do sistema (systemd) e volta sozinho quando o servidor reinicia. SELinux pode ficar ligado (enforcing).",
+      "notas": [
+        "Usuário com sudo (ou rode como root sem o \"sudo\").",
+        "Rocky/RHEL 8: o comando instala o python3.11 do dnf ao lado do python3 do sistema (3.6), sem trocá-lo.",
+        "Pasta: /home/c2/server_monitor; serviço \"server-monitor\" (systemd); painel na sessão tmux \"monitor\"."
+      ],
+      "comandos": [
+        {
+          "id": "unico",
+          "titulo": "Instalar e configurar (um comando só)",
+          "segredo": true,
+          "descricao": "Cole no PuTTY, conectado ao servidor com um usuário que tenha sudo. Instala o necessário, baixa o instalador, aplica a configuração (empresa, nome, Firebase e chave do catálogo) e abre o painel sem perguntar nada. O espaço no começo evita que o comando (com o código de cadastro) fique no histórico do bash; o arquivo temporário com a configuração é apagado em seguida.",
+          "modelo": " F=$(mktemp) && printf '%s\\n' {{config_bash}} > \"$F\" && sudo env USAGE_MONITOR_CONFIG=\"$F\" bash -c 'command -v curl >/dev/null || dnf install -y -q curl; python3 -c \"import sys; sys.exit(sys.version_info < (3, 8))\" 2>/dev/null || command -v python3.11 >/dev/null || dnf install -y -q python3.11; curl -fsSL -H \"Accept: application/vnd.github.raw\" -o /tmp/instalar.sh https://api.github.com/repos/cbalmeida/server_monitor_releases/contents/instalar.sh && bash /tmp/instalar.sh'; rm -f \"$F\""
+        },
+        {
+          "id": "instalar",
+          "titulo": "Só instalar (o monitor pergunta a configuração)",
+          "descricao": "Alternativa sem a configuração embutida: quando o monitor pedir, cole o JSON de configuração abaixo.",
+          "modelo": "sudo bash -c 'command -v curl >/dev/null || dnf install -y -q curl; python3 -c \"import sys; sys.exit(sys.version_info < (3, 8))\" 2>/dev/null || command -v python3.11 >/dev/null || dnf install -y -q python3.11; curl -fsSL -H \"Accept: application/vnd.github.raw\" -o /tmp/instalar.sh https://api.github.com/repos/cbalmeida/server_monitor_releases/contents/instalar.sh && bash /tmp/instalar.sh'"
+        },
+        {
+          "id": "config",
+          "titulo": "JSON de configuração",
+          "segredo": true,
+          "tipo": "json",
+          "descricao": "Para colar quando o monitor perguntar (\"Cole o JSON de configuração\").",
+          "modelo": "{{config_json}}"
+        },
+        {
+          "id": "rodar_de_novo",
+          "titulo": "Rodar o instalador de novo (atualiza; configuração e histórico ficam)",
+          "modelo": "sudo bash /home/c2/server_monitor/instalar.sh"
+        },
+        {
+          "id": "painel",
+          "titulo": "Abrir o painel (Ctrl+B e depois D sai deixando-o aberto; a coleta continua no serviço)",
+          "modelo": "sudo tmux -u new-session -A -s monitor \"bash /home/c2/server_monitor/iniciar.sh --view\"",
+          "descricao": "Abre a sessão tmux \"monitor\" com o painel (ou entra nela, se já existir). Fechar o painel (q) não para o monitor: ele roda como serviço."
+        },
+        {
+          "id": "status",
+          "titulo": "Situação do serviço (ativo? inicia no boot? últimas linhas)",
+          "modelo": "sudo systemctl status server-monitor --no-pager -n 20"
+        },
+        {
+          "id": "parar",
+          "titulo": "Parar o monitor (volta sozinho no próximo boot)",
+          "descricao": "Para o serviço gravando a janela em andamento; a central mostra o monitor parado. Ele volta quando o servidor reiniciar ou com o comando \"Iniciar o monitor\".",
+          "modelo": "sudo systemctl stop server-monitor"
+        },
+        {
+          "id": "iniciar",
+          "titulo": "Iniciar o monitor (depois de parado)",
+          "modelo": "sudo systemctl start server-monitor"
+        },
+        {
+          "id": "mudar_nome",
+          "titulo": "Trocar empresa e nome do servidor (e reiniciar o monitor)",
+          "modelo": "cd /home/c2/server_monitor && sudo \"$(command -v python3.11 || command -v python3)\" usage_monitor.py --empresa {{empresa_bash}} --nome {{nome_bash}} && sudo bash instalar.sh"
+        },
+        {
+          "id": "diagnostico",
+          "titulo": "Diagnóstico (texto para o suporte)",
+          "modelo": "cd /home/c2/server_monitor && sudo \"$(command -v python3.11 || command -v python3)\" usage_monitor.py --diagnostico"
         }
       ]
     },

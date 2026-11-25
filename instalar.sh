@@ -31,6 +31,16 @@ ok()   { echo "  [ok] $*"; }
 erro() { echo "  [ERRO] $*" >&2; exit 1; }
 SUDO=""
 [ "$(id -u)" = 0 ] || SUDO="sudo"
+# gerenciador de pacotes: apt-get (Ubuntu/Debian) ou dnf/yum (Rocky/RHEL 8-9)
+PM=""
+for p in apt-get dnf yum; do command -v "$p" > /dev/null && { PM=$p; break; }; done
+instalar_pacote() {                                       # instalar_pacote <pacote>: 0 = instalado
+    case "$PM" in
+        apt-get) $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$1" > /dev/null ;;
+        dnf|yum) $SUDO "$PM" install -y -q "$1" > /dev/null ;;
+        *) return 1 ;;
+    esac
+}
 
 # 0. Autoatualização ------------------------------------------------------------
 # Uma vez por execução (INSTALADOR_ATUALIZADO evita laço). Sem internet: segue com esta versão.
@@ -94,7 +104,7 @@ case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) ;;
 # 1. Requisitos ---------------------------------------------------------------
 echo "1. Verificando requisitos"
 [ -r /proc/stat ] || erro "este servidor não é Linux."
-command -v curl > /dev/null || erro "curl não encontrado (apt-get install curl)."
+command -v curl > /dev/null || erro "curl não encontrado (${PM:-apt-get} install curl)."
 # Python 3.8+ com curses: o python3 do sistema ou, se ele for antigo, um python3.x instalado ao lado
 # (ex.: Ubuntu 18.04 com python3.8 do apt) - sem trocar o python3 do sistema, que o apt usa.
 PY=""
@@ -102,11 +112,14 @@ for c in python3 python3.13 python3.12 python3.11 python3.10 python3.9 python3.8
     p=$(command -v "$c" 2> /dev/null) || continue
     if "$p" -c 'import sys, curses; sys.exit(sys.version_info < (3, 8))' 2> /dev/null; then PY=$p; break; fi
 done
-[ -n "$PY" ] || erro "precisa de Python 3.8 ou mais novo, com curses (veja 'Preparar o Python' na documentação de instalação)."
+if [ -z "$PY" ]; then
+    case "$PM" in dnf|yum) erro "precisa de Python 3.8 ou mais novo, com curses (Rocky/RHEL 8: sudo $PM install python3.11)." ;; esac
+    erro "precisa de Python 3.8 ou mais novo, com curses (veja 'Preparar o Python' na documentação de instalação)."
+fi
 ok "python $("$PY" -c 'import platform; print(platform.python_version())') ($PY)"
 if ! command -v tmux > /dev/null; then
     echo "  instalando tmux..."
-    $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tmux > /dev/null || erro "falha ao instalar tmux."
+    instalar_pacote tmux || erro "falha ao instalar tmux (${PM:-apt-get/dnf não encontrado}; instale o tmux e rode de novo)."
 fi
 ok "tmux"
 
