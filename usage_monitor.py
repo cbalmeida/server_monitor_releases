@@ -106,7 +106,7 @@ except ImportError:
 from array import array
 from xml.sax.saxutils import escape as xml_escape
 
-VERSION = "2.26.0"
+VERSION = "2.26.1"
 # Projeto Firebase da C2 (padrão do --firebase-setup). Não são segredos: a URL só identifica o banco e
 # a chave só identifica o projeto (restrita às APIs de login); o acesso é decidido pelas regras.
 FIREBASE_DB_URL = "https://c2-server-monitor-default-rtdb.firebaseio.com"
@@ -9424,13 +9424,18 @@ ORDER_STATS_WINDOWS = ("h1", "h24", "d7", "d30")
 ORDER_STATS_COUNTS = ("pedidos", "clientes", "rcas", "cidades")
 ORDER_STATS_VALUES = ("valor", "valor_atendido")
 ORDER_STATS_IBGE_RE = re.compile(r"^[0-9]{6,7}$")
-C2STAT_SQL_VERSION = 1             # versão do SQL abaixo (c2stat.f_info().sql_versao menor = reinstala)
-# Instalação/atualização do esquema c2stat (cópia de sql/c2stat_v1.sql), enviada numa Query só (protocolo simples)
+ORDER_STATS_OWNER_EVERY = 60       # s entre chamadas de c2stat.f_dono (um agente por banco; v2.26.1)
+ORDER_STATS_OWNER_STALE = 1800     # s sem sinal do dono para outro agente do mesmo banco assumir
+ORDER_STATS_ROLES = ("dono", "reserva")
+C2STAT_SQL_VERSION = 2             # versão do SQL abaixo (c2stat.f_info().sql_versao menor = reinstala)
+# Instalação/atualização do esquema c2stat (cópia de sql/c2stat_v2.sql; o v1 fica no repositório como histórico), enviada numa Query só (protocolo simples)
 # dentro do BEGIN + SET LOCAL do agente: o BEGIN/COMMIT do próprio script só geram aviso (WARNING) e os timeouts
 # locais valem até o COMMIT dele; erro no meio = nada aplicado (ROLLBACK). Vazio = ainda não incorporado: o agente
 # nunca instala (erro sem_sql).
-C2STAT_SQL = """-- c2stat v1 - estatisticas de pedidos da C2 (variante WinThor)
+C2STAT_SQL = """-- c2stat v2 - estatisticas de pedidos da C2 (variante WinThor)
 -- Contrato e regras em docs/ESTATISTICAS_PEDIDOS.md (server_monitor).
+-- v2: um agente por banco (c2stat.f_dono; colunas dono_* em c2stat.controle). Atualiza uma instalacao v1 sem
+-- perder dados (ADD COLUMN IF NOT EXISTS; funcoes recriadas).
 -- Requisito: PostgreSQL 9.6 (nada de recurso posterior). Texto so em ASCII (bancos LATIN1).
 -- Idempotente: rodar de novo so recria as funcoes; tabelas e dados ficam.
 -- So escreve no esquema c2stat. Le e1.cabpedido_com, e1.sitpedido_com, e1.cliente_com e e1.cidade_com
@@ -9458,6 +9463,13 @@ CREATE TABLE IF NOT EXISTS c2stat.controle (
   instalado_em     timestamptz NOT NULL DEFAULT now(),
   atualizado_em    timestamptz NOT NULL DEFAULT now()
 );
+
+-- v2: agente que apura e envia por este banco (docs/ESTATISTICAS_PEDIDOS.md "Um agente por banco")
+ALTER TABLE c2stat.controle ADD COLUMN IF NOT EXISTS dono_sid        text;         -- install_id do agente
+ALTER TABLE c2stat.controle ADD COLUMN IF NOT EXISTS dono_plataforma text;         -- linux | windows
+ALTER TABLE c2stat.controle ADD COLUMN IF NOT EXISTS dono_nome       text;         -- nome amigavel (ASCII)
+ALTER TABLE c2stat.controle ADD COLUMN IF NOT EXISTS dono_sinal      timestamptz;  -- ultima renovacao
+ALTER TABLE c2stat.controle ADD COLUMN IF NOT EXISTS dono_desde      timestamptz;  -- desde quando e o dono
 
 -- pedidos com dt_rec_pedido nos ultimos 45 dias, com a contribuicao como foi somada (conta = 0 tambem fica,
 -- para o fechamento achar o pedido que passou a contar)
@@ -9530,8 +9542,8 @@ BEGIN
   END IF;
 END $$;
 
-INSERT INTO c2stat.controle (id, sql_versao, variante) VALUES (1, 1, 'winthor') ON CONFLICT (id) DO NOTHING;
-UPDATE c2stat.controle SET sql_versao = 1, variante = 'winthor', atualizado_em = now() WHERE id = 1;
+INSERT INTO c2stat.controle (id, sql_versao, variante) VALUES (1, 2, 'winthor') ON CONFLICT (id) DO NOTHING;
+UPDATE c2stat.controle SET sql_versao = 2, variante = 'winthor', atualizado_em = now() WHERE id = 1;
 
 -- ---------------------------------------------------------------- auxiliares
 
@@ -9803,6 +9815,66 @@ BEGIN
 END
 $$;
 
+-- ---------------------------------------------------------------- dono (um agente por banco)
+-- Chamada pelo agente a cada minuto, antes de apurar/fechar/enviar. So o dono apura e envia stats/{sid}; os
+-- outros agentes do mesmo banco ficam de reserva (sem somar em dobro na central). Regras, nesta ordem:
+--   sem dono, ou dono sem sinal ha mais de p_stale_s s  -> assume
+--   o proprio dono                                      -> renova o sinal (nome/plataforma atualizados)
+--   linux chegando com dono windows (ativo)             -> linux assume
+--   qualquer outro caso (windows x linux ativo, mesma plataforma ativa) -> nao assume
+-- Transacao curta: trava a linha de controle com SKIP LOCKED; se f_apurar/f_fechamento (do dono) estiverem com
+-- ela, nao espera: decide pelo que esta gravado sem mudar nada ('travado': true; so o dono registrado e dono).
+CREATE OR REPLACE FUNCTION c2stat.f_dono(p_sid text, p_plataforma text, p_nome text, p_stale_s integer DEFAULT 1800)
+RETURNS json LANGUAGE plpgsql AS $$
+DECLARE
+  c        c2stat.controle;
+  v_trav   boolean := false;
+  v_ativo  boolean;
+  v_dono   boolean;
+BEGIN
+  p_sid := btrim(coalesce(p_sid, ''));
+  p_plataforma := lower(btrim(coalesce(p_plataforma, '')));
+  p_nome := left(btrim(coalesce(p_nome, '')), 128);
+  IF p_sid = '' OR length(p_sid) > 64 THEN
+    RAISE EXCEPTION 'c2stat.f_dono: sid invalido';
+  END IF;
+  IF p_plataforma NOT IN ('linux', 'windows') THEN
+    RAISE EXCEPTION 'c2stat.f_dono: plataforma invalida (linux ou windows)';
+  END IF;
+  IF p_stale_s IS NULL OR p_stale_s < 60 THEN
+    p_stale_s := 1800;
+  END IF;
+
+  SELECT * INTO c FROM c2stat.controle WHERE id = 1 FOR UPDATE SKIP LOCKED;
+  IF NOT FOUND THEN
+    SELECT * INTO c FROM c2stat.controle WHERE id = 1;
+    v_trav := true;
+  END IF;
+  v_ativo := c.dono_sid IS NOT NULL AND c.dono_sinal IS NOT NULL
+             AND c.dono_sinal >= now() - p_stale_s * interval '1 second';
+
+  IF v_trav THEN
+    v_dono := c.dono_sid = p_sid;
+  ELSIF c.dono_sid = p_sid THEN
+    UPDATE c2stat.controle SET dono_plataforma = p_plataforma, dono_nome = p_nome, dono_sinal = now(),
+                               dono_desde = coalesce(dono_desde, now())
+     WHERE id = 1 RETURNING * INTO c;
+    v_dono := true;
+  ELSIF NOT v_ativo OR (p_plataforma = 'linux' AND coalesce(c.dono_plataforma, '') <> 'linux') THEN
+    UPDATE c2stat.controle SET dono_sid = p_sid, dono_plataforma = p_plataforma, dono_nome = p_nome,
+                               dono_sinal = now(), dono_desde = now()
+     WHERE id = 1 RETURNING * INTO c;
+    v_dono := true;
+  ELSE
+    v_dono := false;
+  END IF;
+
+  RETURN json_build_object(
+    'dono', coalesce(v_dono, false), 'sid', c.dono_sid, 'plataforma', c.dono_plataforma, 'nome', c.dono_nome,
+    'sinal', c2stat.f_iso(c.dono_sinal), 'desde', c2stat.f_iso(c.dono_desde), 'travado', v_trav);
+END
+$$;
+
 -- ---------------------------------------------------------------- leitura
 CREATE OR REPLACE FUNCTION c2stat.f_info() RETURNS json LANGUAGE plpgsql STABLE AS $$
 DECLARE
@@ -9813,7 +9885,9 @@ BEGIN
     'sql_versao', c.sql_versao, 'variante', c.variante,
     'carga', json_build_object('completa', c.carga_completa, 'pct', c2stat.f_pct(c),
                                'ultimo_cod', c.ultimo_cod, 'max_cod', c.max_cod),
-    'ultima_apuracao', c2stat.f_iso(c.ultima_apuracao), 'fechamento_em', c2stat.f_iso(c.fechamento_em));
+    'ultima_apuracao', c2stat.f_iso(c.ultima_apuracao), 'fechamento_em', c2stat.f_iso(c.fechamento_em),
+    'dono', json_build_object('sid', c.dono_sid, 'plataforma', c.dono_plataforma, 'nome', c.dono_nome,
+                              'sinal', c2stat.f_iso(c.dono_sinal), 'desde', c2stat.f_iso(c.dono_desde)));
 END
 $$;
 
@@ -9900,6 +9974,7 @@ C2STAT_Q_INFO = "SELECT c2stat.f_info()::text"
 C2STAT_Q_APURAR = "SELECT c2stat.f_apurar($1::int)::text"
 C2STAT_Q_FECHAMENTO = "SELECT c2stat.f_fechamento()::text"
 C2STAT_Q_RESUMO = "SELECT c2stat.f_resumo()::text"
+C2STAT_Q_DONO = "SELECT c2stat.f_dono($1::text, $2::text, $3::text, $4::int)::text"
 C2STAT_MISSING = ("3F000", "42883", "42P01")   # esquema, função ou tabela inexistente = instalar
 
 
@@ -9987,6 +10062,9 @@ class OrderStats:
     - f_fechamento() uma vez por dia entre 02:00 e 04:00 locais (data no estado), só com a carga completa.
     - f_resumo() + stats/{sid} a cada stats.send_s (agent_config; padrão ORDER_STATS_SEND), por diferença como o
       status: inteiro na 1ª vez do processo e a cada ORDER_STATS_FULL_EVERY; sem pedido nenhum não envia.
+    - Um agente por banco (v2.26.1): c2stat.f_dono a cada ORDER_STATS_OWNER_EVERY decide quem apura e envia (Linux
+      primeiro; dono sem sinal por ORDER_STATS_OWNER_STALE perde a vez). Reserva = não apura, não fecha, não envia
+      o resumo; grava uma vez stats/{sid} = {info (papel reserva + dono_*), at}, sem totais (fora das somas).
     Estado em SYNC_DIR/order_stats.json (atômico, 600): o --diagnostico mostra."""
 
     def __init__(self, cloud, db, acfg=None, out=None):
@@ -10003,6 +10081,8 @@ class OrderStats:
         self.send_fails = 0
         self.sent = None                  # (canon dos campos, canon das cidades, hora do último envio inteiro)
         self.saved_at = 0.0
+        self.owner_at = 0.0               # próxima chamada de c2stat.f_dono
+        self.reserve_sent = None          # (sid, nome, plataforma) do dono no último stats/{sid} de reserva confirmado
 
     # ---- estado ----
     def load(self):
@@ -10012,6 +10092,9 @@ class OrderStats:
               "carga": ostat_carga(d.get("carga"))}
         for k in ("fechamento_dia", "error_code", "error", "state"):
             st[k] = d[k] if isinstance(d.get(k), str) else ""
+        st["papel"] = d["papel"] if d.get("papel") in ORDER_STATS_ROLES else ""
+        dono = d.get("dono") if isinstance(d.get("dono"), dict) else {}
+        st["dono"] = {k: ostat_txt(dono.get(k), 128) for k in ("sid", "nome", "plataforma")}
         for k in ("apurado_at", "fechamento_at", "enviado_at", "instalado_at"):
             st[k] = d[k] if is_num(d.get(k)) else 0
         return st
@@ -10099,6 +10182,14 @@ class OrderStats:
         try:
             if now >= self.info_at:
                 self.check_schema(c, now)
+            if now >= self.owner_at and self.check_owner(c, now) is None:
+                return max(0.05, self.owner_at - now)     # controle travado e sem dono gravado: decide logo
+            if self.st["papel"] == "reserva":
+                self.send_reserve(now)
+                self.fails = 0
+                self.set_state("reserva", "", "apurado por %s" % self.owner_label())
+                return max(0.0, min(self.info_at, self.owner_at, self.send_at if self.reserve_sent is None
+                                    else self.owner_at) - now)
             if now >= self.apurar_at:
                 self.apurar(c, now)
             if self.close_due(now):
@@ -10111,9 +10202,73 @@ class OrderStats:
             self.set_state("erro", code if re.match(r"^[a-z_]{1,64}$", code) else "interno", str(e))
             return self.fail(now)
         self.fails = 0
-        if self.st["state"] in ("", "erro", "desligado"):
+        if self.st["state"] in ("", "erro", "desligado", "reserva"):
             self.set_state("ok")
-        return max(0.0, min(self.info_at, self.apurar_at, self.send_at) - now)
+        return max(0.0, min(self.info_at, self.owner_at, self.apurar_at, self.send_at) - now)
+
+    # ---- um agente por banco (v2.26.1) ----
+    def platform(self):
+        return "windows" if IS_WINDOWS else "linux"
+
+    def agent_name(self):
+        return mesh_agent_name(self.ident.name or socket.gethostname())[:128]
+
+    def owner_label(self):
+        d = self.st["dono"]
+        return "%s (%s, %s)" % (d["nome"] or "-", d["plataforma"] or "?", d["sid"] or "?")
+
+    def check_owner(self, c, now):
+        """c2stat.f_dono: este agente é o dono (apura e envia) ou reserva. Reserva -> dono = próximo envio inteiro
+        e já; dono -> reserva = stats/{sid} de reserva (uma vez por dono)."""
+        r = self.call(c, C2STAT_Q_DONO, [self.sid, self.platform(), self.agent_name(),
+                                         str(ORDER_STATS_OWNER_STALE)], ORDER_STATS_READ_MS)
+        dono = {"sid": ostat_txt(r.get("sid"), 64), "nome": ostat_txt(r.get("nome"), 128),
+                "plataforma": ostat_txt(r.get("plataforma"), 16)}
+        if r.get("dono") is not True and not dono["sid"]:
+            # linha de controle com outra apuração (agente anterior à v2.26.1) e ninguém registrado: tenta já já
+            self.owner_at = now + ORDER_STATS_PAUSE
+            return None
+        papel = "dono" if r.get("dono") is True else "reserva"
+        was = self.st["papel"]
+        self.owner_at = now + ORDER_STATS_OWNER_EVERY
+        if papel == "dono" and was != "dono":
+            self.sent, self.send_at, self.reserve_sent = None, 0.0, None
+            if was == "reserva":
+                self.say("Estatísticas de pedidos: este agente passou a apurar o banco (era reserva).")
+        elif papel == "reserva" and (was != "reserva" or dono != self.st["dono"]):
+            self.reserve_sent, self.send_at = None, 0.0
+            self.say("Estatísticas de pedidos: banco já apurado por outro agente (%s, %s); este fica de reserva."
+                     % (dono["nome"] or dono["sid"], dono["plataforma"] or "?"))
+        if (papel, dono) != (was, self.st["dono"]):
+            self.st["papel"], self.st["dono"] = papel, dono
+            self.save()
+        return papel
+
+    def reserve_doc(self):
+        info = self.info_doc()
+        d = self.st["dono"]
+        info.update(dono_sid=d["sid"], dono_nome=d["nome"])
+        if d["plataforma"] in ("linux", "windows"):
+            info["dono_plataforma"] = d["plataforma"]
+        return {"info": info, "at": {".sv": "timestamp"}}
+
+    def send_reserve(self, now):
+        """stats/{sid} de reserva (inteiro, sem totais), uma vez por dono; falha = tenta de novo com espera."""
+        key = tuple(self.st["dono"][k] for k in ("sid", "nome", "plataforma"))
+        if self.reserve_sent == key or now < self.send_at:
+            return "feito" if self.reserve_sent == key else "aguardando"
+        try:
+            self.live.patch("", {"stats/" + self.sid: self.reserve_doc()}, timeout=30)
+        except CloudError as e:
+            self.send_fails += 1
+            self.send_at = now + min(ORDER_STATS_SEND_RETRY[1], ORDER_STATS_SEND_RETRY[0] * 2 ** (self.send_fails - 1))
+            if self.send_fails == 1:
+                self.say("Estatísticas de pedidos: envio falhou (%s); tentando de novo." % e)
+            return "erro"
+        self.reserve_sent, self.send_fails, self.sent = key, 0, None
+        self.st["enviado_at"] = int(now * 1000)
+        self.save()
+        return "ok"
 
     # ---- Postgres ----
     def conn(self, c):
@@ -10247,7 +10402,8 @@ class OrderStats:
     # ---- Firebase ----
     def info_doc(self):
         d = {"agent_version": VERSION, "sql_versao": self.st["sql_versao"], "sql_agente": C2STAT_SQL_VERSION,
-             "variante": self.st["variante"], "carga": dict(self.st["carga"]), "apurado_at": int(self.st["apurado_at"])}
+             "variante": self.st["variante"], "carga": dict(self.st["carga"]), "apurado_at": int(self.st["apurado_at"]),
+             "papel": "reserva" if self.st["papel"] == "reserva" else "dono"}
         if self.st["fechamento_dia"]:
             d.update(fechamento_dia=self.st["fechamento_dia"], fechamento_at=int(self.st["fechamento_at"]))
         return d
@@ -10319,6 +10475,12 @@ def order_stats_report(ident, out=print):
     out("  esquema no banco: v%s %s | carga inicial: %s | apuração: %s | fechamento: %s | envio: %s" % (
         st.get("sql_versao") or "-", st.get("variante") or "", "completa" if carga.get("completa") is True
         else "%s%%" % carga.get("pct", 0), ms("apurado_at"), st.get("fechamento_dia") or "-", ms("enviado_at")))
+    dono = st.get("dono") if isinstance(st.get("dono"), dict) else {}
+    if st.get("papel") == "reserva":
+        out("  papel: RESERVA (um agente por banco) | apurado e enviado por %s (%s, sid %s)" % (
+            dono.get("nome") or "-", dono.get("plataforma") or "?", dono.get("sid") or "?"))
+    elif st.get("papel") == "dono":
+        out("  papel: dono (este agente apura e envia o banco)")
     if st.get("error_code"):
         out("  estado: %s | erro %s: %s" % (st.get("state") or "-", st["error_code"], st.get("error") or ""))
 
