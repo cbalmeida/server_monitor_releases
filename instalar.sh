@@ -128,6 +128,13 @@ echo "2. Baixando o programa"
 mkdir -p "$DIR" && cd "$DIR" || erro "não consegui criar $DIR"
 ATUALIZACAO=0
 [ -f usage_monitor.py ] && ATUALIZACAO=1
+# baixa e confere ANTES de parar o que está rodando: sem internet (DNS, proxy) o monitor atual segue como estava
+MANTIDO=""
+[ "$ATUALIZACAO" = 1 ] && MANTIDO=" Nada foi alterado: o monitor instalado segue rodando."
+curl -fsSL -H "Accept: application/vnd.github.raw" -o usage_monitor.py.novo "$REPO_URL" \
+    || { rm -f usage_monitor.py.novo; erro "falha no download (sem internet?).$MANTIDO"; }
+"$PY" -c 'import ast, sys; ast.parse(open("usage_monitor.py.novo").read())' 2> /dev/null \
+    || { rm -f usage_monitor.py.novo; erro "arquivo baixado está corrompido; tente de novo.$MANTIDO"; }
 if tmux has-session -t "$SESSAO" 2> /dev/null; then
     DONO=$(tmux display-message -p -t "$SESSAO" '#{pane_current_path}' 2> /dev/null)
     if [ -n "$DONO" ] && [ "$(cd "$DONO" 2> /dev/null && pwd)" != "$(pwd)" ]; then
@@ -157,10 +164,6 @@ for f in usage_report_*.log; do
         erro "há um monitor gravando em $DIR/$f fora da sessão tmux '$SESSAO' e do serviço. Pare-o (q duas vezes no painel, ou: pkill -f usage_monitor.py) e rode de novo."
     fi
 done
-curl -fsSL -H "Accept: application/vnd.github.raw" -o usage_monitor.py.novo "$REPO_URL" \
-    || erro "falha no download (sem internet?)."
-"$PY" -c 'import ast, sys; ast.parse(open("usage_monitor.py.novo").read())' 2> /dev/null \
-    || erro "arquivo baixado está corrompido; tente de novo."
 mv usage_monitor.py.novo usage_monitor.py && chmod +x usage_monitor.py
 ok "$("$PY" usage_monitor.py --version) em $DIR"
 # Configuração pronta (comando único gerado pela central em "Instalar agente"): USAGE_MONITOR_CONFIG = arquivo com
