@@ -106,7 +106,7 @@ except ImportError:
 from array import array
 from xml.sax.saxutils import escape as xml_escape
 
-VERSION = "2.26.2"
+VERSION = "2.26.3"
 # Projeto Firebase da C2 (padrão do --firebase-setup). Não são segredos: a URL só identifica o banco e
 # a chave só identifica o projeto (restrita às APIs de login); o acesso é decidido pelas regras.
 FIREBASE_DB_URL = "https://c2-server-monitor-default-rtdb.firebaseio.com"
@@ -9443,6 +9443,8 @@ ORDER_STATS_IBGE_RE = re.compile(r"^[0-9]{6,7}$")
 ORDER_STATS_OWNER_EVERY = 60       # s entre chamadas de c2stat.f_dono (um agente por banco; v2.26.1)
 ORDER_STATS_OWNER_STALE = 1800     # s sem sinal do dono para outro agente do mesmo banco assumir
 ORDER_STATS_ROLES = ("dono", "reserva")
+ORDER_STATS_COMPANIES_MAX = 20     # códigos de empresa C2 em info.empresas (o legado é empresa única: normalmente 1)
+ORDER_STATS_COMPANY_RE = re.compile(r"^[0-9]{1,6}$")
 C2STAT_SQL_VERSION = 2             # versão do SQL abaixo (c2stat.f_info().sql_versao menor = reinstala)
 # Instalação/atualização do esquema c2stat (cópia de sql/c2stat_v2.sql; o v1 fica no repositório como histórico), enviada numa Query só (protocolo simples)
 # dentro do BEGIN + SET LOCAL do agente: o BEGIN/COMMIT do próprio script só geram aviso (WARNING) e os timeouts
@@ -9991,6 +9993,8 @@ C2STAT_Q_APURAR = "SELECT c2stat.f_apurar($1::int)::text"
 C2STAT_Q_FECHAMENTO = "SELECT c2stat.f_fechamento()::text"
 C2STAT_Q_RESUMO = "SELECT c2stat.f_resumo()::text"
 C2STAT_Q_DONO = "SELECT c2stat.f_dono($1::text, $2::text, $3::text, $4::int)::text"
+# código da empresa C2 (o CPP do SocketServer): o site soma os totais por empresa (reinstalação não conta 2 vezes)
+C2STAT_Q_EMPRESAS = "SELECT DISTINCT CAST(cod_emprs AS text) FROM e1.parampre_com LIMIT 50"
 C2STAT_MISSING = ("3F000", "42883", "42P01")   # esquema, função ou tabela inexistente = instalar
 
 
@@ -10028,6 +10032,17 @@ def ostat_block(d, counts=ORDER_STATS_COUNTS, values=ORDER_STATS_VALUES):
 def ostat_carga(d):
     d = d if isinstance(d, dict) else {}
     return {"completa": d.get("completa") is True, "pct": max(0, min(100, ostat_num(d.get("pct"))))}
+
+
+def ostat_companies(rows):
+    """Linhas de C2STAT_Q_EMPRESAS -> códigos só com dígitos (sem zeros à esquerda), ordenados, sem 0 e 1 (genéricos:
+    o admin.* usa cod_emprs = 1 fixo), até ORDER_STATS_COMPANIES_MAX."""
+    out = set()
+    for r in rows or ():
+        v = str(r[0] if r else "").strip()
+        if ORDER_STATS_COMPANY_RE.match(v) and int(v) > 1:
+            out.add(str(int(v)))
+    return sorted(out, key=int)[:ORDER_STATS_COMPANIES_MAX]
 
 
 def order_stats_doc(r, info):
@@ -10109,6 +10124,7 @@ class OrderStats:
         for k in ("fechamento_dia", "error_code", "error", "state"):
             st[k] = d[k] if isinstance(d.get(k), str) else ""
         st["papel"] = d["papel"] if d.get("papel") in ORDER_STATS_ROLES else ""
+        st["empresas"] = ostat_companies([[v] for v in d.get("empresas")] if isinstance(d.get("empresas"), list) else ())
         dono = d.get("dono") if isinstance(d.get("dono"), dict) else {}
         st["dono"] = {k: ostat_txt(dono.get(k), 128) for k in ("sid", "nome", "plataforma")}
         for k in ("apurado_at", "fechamento_at", "enviado_at", "instalado_at"):
@@ -10345,6 +10361,24 @@ class OrderStats:
             raise DbError("instalacao", "falha ao instalar o esquema c2stat: %s" % err)
         pg.simple("COMMIT")
 
+    def companies(self, c):
+        """Códigos de empresa de e1.parampre_com (só SELECT, transação READ ONLY curta). Sem a tabela ou erro na
+        consulta = None (mantém os anteriores; as estatísticas seguem); conexão caída = DbError."""
+        pg = self.conn_for(c, ORDER_STATS_READ_MS)
+        try:
+            pg.simple("BEGIN TRANSACTION READ ONLY; SET LOCAL statement_timeout = %d; SET LOCAL lock_timeout = %d"
+                      % (ORDER_STATS_READ_MS, ORDER_STATS_LOCK_MS))
+            rows = pg.query(C2STAT_Q_EMPRESAS, [], 50, DB_MAX_MSG)[2]
+            pg.simple("COMMIT")
+        except DbError as e:
+            if e.broken:
+                self.close_pg()
+                raise
+            with contextlib.suppress(DbError):
+                pg.simple("ROLLBACK")
+            return None
+        return ostat_companies(rows)
+
     def check_schema(self, c, now):
         info = self.info(c)
         have = ostat_int(info.get("sql_versao")) if info is not None else 0
@@ -10363,6 +10397,10 @@ class OrderStats:
         self.st.update(sql_versao=have, variante=ostat_txt(info.get("variante"), 32))
         if isinstance(info.get("carga"), dict):
             self.st["carga"] = ostat_carga(info["carga"])
+        emp = self.companies(c)
+        if emp is not None and emp != self.st["empresas"]:
+            self.st["empresas"] = emp
+            self.reserve_sent = None                      # reserva: regrava o stats/{sid} com as empresas novas
         self.info_at = now + ORDER_STATS_INFO_EVERY
         self.save()
 
@@ -10422,6 +10460,8 @@ class OrderStats:
              "papel": "reserva" if self.st["papel"] == "reserva" else "dono"}
         if self.st["fechamento_dia"]:
             d.update(fechamento_dia=self.st["fechamento_dia"], fechamento_at=int(self.st["fechamento_at"]))
+        if self.st["empresas"]:
+            d["empresas"] = list(self.st["empresas"])
         return d
 
     def entries(self, doc, now):
